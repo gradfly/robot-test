@@ -1,0 +1,443 @@
+/**
+ * main.js —— elf3 网页端 MuJoCo 查看器 / VR 沉浸式观看
+ *
+ * 流程：加载 MuJoCo WASM → 把 XML/STL 灌进虚拟文件系统 → 编译模型 →
+ *       用 data.geom_xpos/geom_xmat 驱动 three.js 场景 → 静止站立（默认）或实时物理
+ */
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import loadMujoco from '../vendor/mujoco.js';
+import { MjScene } from './mjscene.js';
+import { VRNav } from './vrnav.js';
+
+// ---------------------------------------------------------------- 配置
+const CFG = {
+  assetsBase: new URL('../assets/', import.meta.url).href,
+  entryXml: 'elf3.xml',
+  fetchConcurrency: 6,
+  maxPhysicsStepsPerFrame: 24,
+  defaultTimestep: 0.002,
+};
+
+// ---------------------------------------------------------------- DOM
+const $ = (id) => document.getElementById(id);
+const canvas = $('view');
+const elLoading = $('loading');
+const elBar = $('ld-bar');
+const elStep = $('ld-step');
+const elPct = $('ld-pct');
+const elLog = $('ld-log');
+const elHint = $('ld-hint');
+
+let logLines = 0;
+function setProgress(pct, step) {
+  const p = Math.max(0, Math.min(100, pct));
+  elBar.style.width = `${p.toFixed(1)}%`;
+  elPct.textContent = `${Math.round(p)}%`;
+  if (step) elStep.textContent = step;
+}
+function log(msg) {
+  logLines++;
+  elLog.textContent += (logLines > 1 ? '\n' : '') + msg;
+  elLog.scrollTop = elLog.scrollHeight;
+}
+function fail(err) {
+  elLoading.classList.add('error');
+  elStep.textContent = '启动失败';
+  elHint.textContent = String(err && err.message ? err.message : err);
+  elHint.style.color = '#ff8f8f';
+  console.error(err);
+}
+let toastTimer = null;
+function toast(msg, ms = 2200) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), ms);
+}
+
+// 把运行时异常也写进加载日志，方便排查（headless 自检也会用到）
+window.addEventListener('error', (e) => {
+  log(`! 运行时错误: ${e.message} @ ${e.filename ?? ''}:${e.lineno ?? 0}`);
+  $('ld-hint').textContent = `运行时错误：${e.message}`;
+  $('ld-hint').style.color = '#ff8f8f';
+});
+window.addEventListener('unhandledrejection', (e) => {
+  log(`! 未处理的 Promise 拒绝: ${e.reason?.message || e.reason}`);
+});
+
+// ---------------------------------------------------------------- 工具
+async function fetchWithProgress(url, onBytes) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${url}`);
+  const len = Number(res.headers.get('content-length')) || 0;
+  if (!res.body || !res.body.getReader) {
+    const buf = await res.arrayBuffer();
+    onBytes?.(buf.byteLength);
+    return buf;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.byteLength;
+    onBytes?.(value.byteLength);
+  }
+  const out = new Uint8Array(len || got);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out.buffer;
+}
+
+async function mapLimit(items, limit, worker) {
+  const ret = new Array(items.length);
+  let i = 0;
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      ret[idx] = await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+  return ret;
+}
+
+function makeSkyTexture() {
+  const cv = document.createElement('canvas');
+  cv.width = 8; cv.height = 256;
+  const ctx = cv.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, 0, 256);
+  g.addColorStop(0.0, '#060a11');
+  g.addColorStop(0.42, '#14263a');
+  g.addColorStop(0.53, '#2c4560');
+  g.addColorStop(0.62, '#16232f');
+  g.addColorStop(1.0, '#080c12');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 8, 256);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// ---------------------------------------------------------------- 全局状态
+let renderer, scene, camera, controls, stage, mjScene, vrNav, mujoco, model, data;
+let clock, simulating = false, physicsAcc = 0, timestep = CFG.defaultTimestep;
+let fpsAcc = 0, fpsFrames = 0, fps = 0;
+let standQpos = null; // 落地对齐后的静止站立姿态（复位用）
+
+const VIEWS = {
+  front: { pos: [0.0, 1.30, 2.75], target: [0, 0.95, 0] },
+  back:  { pos: [0.0, 1.35, -2.75], target: [0, 0.95, 0] },
+  side:  { pos: [2.90, 1.35, 0.0], target: [0, 0.95, 0] },
+  head:  { pos: [0.95, 1.42, 1.35], target: [0, 1.22, 0] },
+  top:   { pos: [0.01, 5.20, 3.10], target: [0, 0.80, 0] },
+  wide:  { pos: [7.20, 4.60, 10.5], target: [1.6, 0.90, 0] },
+};
+
+function applyView(name) {
+  const v = VIEWS[name];
+  if (!v || !controls) return;
+  camera.position.set(...v.pos);
+  controls.target.set(...v.target);
+  controls.update();
+}
+
+// ---------------------------------------------------------------- 启动
+async function boot() {
+  setProgress(2, '创建 WebGL 渲染器');
+
+  renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: true,
+    alpha: false,
+    powerPreference: 'high-performance',
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.autoUpdate = false; // 场景基本静止，阴影贴图按需刷新
+  renderer.xr.enabled = true;
+
+  scene = new THREE.Scene();
+  scene.background = makeSkyTexture();
+  scene.fog = new THREE.Fog(0x16232f, 34, 130);
+
+  camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.05, 300);
+  camera.position.set(2.05, 1.52, 3.05);
+  scene.add(camera);
+
+  // 环境光照：RoomEnvironment 提供金属件需要的高光反射
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  const envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
+  scene.environment = envRT.texture;
+  scene.environmentIntensity = 0.55;
+  pmrem.dispose();
+
+  // world 光照都挂在 stage 里，跟着世界一起平移/旋转
+  stage = new THREE.Group();
+  stage.name = 'stage';
+  scene.add(stage);
+
+  const hemi = new THREE.HemisphereLight(0xbcd8ff, 0x2a3341, 0.75);
+  stage.add(hemi);
+
+  const key = new THREE.DirectionalLight(0xffffff, 2.35);
+  key.position.set(4.2, 7.6, 5.6);
+  key.target.position.set(0, 0.85, 0);
+  key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024);
+  key.shadow.camera.near = 0.5;
+  key.shadow.camera.far = 24;
+  key.shadow.camera.left = -3.6;
+  key.shadow.camera.right = 3.6;
+  key.shadow.camera.top = 3.2;
+  key.shadow.camera.bottom = -3.2;
+  key.shadow.bias = -0.0012;
+  key.shadow.normalBias = 0.02;
+  stage.add(key, key.target);
+
+  const rim = new THREE.DirectionalLight(0x7fb6ff, 0.7);
+  rim.position.set(-4.5, 3.2, -5.0);
+  stage.add(rim);
+
+  clock = new THREE.Clock();
+
+  // ---------------- MuJoCo WASM ----------------
+  setProgress(5, '加载 MuJoCo WebAssembly 引擎');
+  log('· 正在下载 MuJoCo WASM（约 10 MB）…');
+  mujoco = await loadMujoco();
+  log('· MuJoCo WASM 就绪');
+  setProgress(42, '读取资源清单');
+
+  const manifest = await (await fetch(`${CFG.assetsBase}manifest.json`)).json();
+  const total = manifest.totalBytes || manifest.files.reduce((a, f) => a + f.size, 0);
+  let loaded = 0;
+  setProgress(44, `加载模型资源（${manifest.files.length} 个文件 / ${(total / 1048576).toFixed(1)} MB）`);
+
+  const buffers = new Map();
+  await mapLimit(manifest.files, CFG.fetchConcurrency, async (f) => {
+    const buf = await fetchWithProgress(`${CFG.assetsBase}${f.path}`, (n) => {
+      loaded += n;
+      setProgress(44 + 38 * (loaded / total), `加载模型资源 ${(loaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`);
+    });
+    buffers.set(f.path, buf);
+  });
+  log(`· 资源就绪：${buffers.size} 个文件`);
+
+  // ---------------- 编译模型 ----------------
+  setProgress(84, '编译 MuJoCo 模型');
+  const vfs = new mujoco.MjVFS();
+  for (const f of manifest.files) {
+    vfs.addBuffer(f.path, new Uint8Array(buffers.get(f.path)));
+  }
+  const entryBuf = buffers.get(CFG.entryXml) || buffers.get(manifest.entry);
+  const xmlText = new TextDecoder().decode(new Uint8Array(entryBuf));
+
+  const t0 = performance.now();
+  model = mujoco.MjModel.from_xml_string(xmlText, vfs);
+  data = new mujoco.MjData(model);
+  mujoco.mj_forward(model, data);
+  try { timestep = model.opt?.timestep || CFG.defaultTimestep; } catch { timestep = CFG.defaultTimestep; }
+  log(`· 模型编译完成：${model.nbody} 个刚体 / ${model.ngeom} 个几何 / ${model.nq} DOF（${(performance.now() - t0).toFixed(0)} ms）`);
+
+  setProgress(91, '构建三维场景');
+  mjScene = new MjScene({ THREE, mujoco, model, data }).build();
+  stage.add(mjScene.wrapZUp());
+  log(`· 网格三角面 ${mjScene.stats.triangles.toLocaleString()} 个 / 几何体 ${mjScene.stats.geometries} 个`);
+
+  // 站立姿态落地对齐：模型初始 free joint 高度让脚底略低于 z=0，
+  // 这里按视觉网格最低点整体抬到底面正好贴地，避免脚陷进地板。
+  {
+    const minZ = mjScene.robotMinZ();
+    if (Number.isFinite(minZ) && Math.abs(minZ) > 1e-4) {
+      data.qpos[2] -= minZ;
+      mujoco.mj_forward(model, data);
+      mjScene.sync();
+      log(`· 落地对齐：底座${minZ > 0 ? '下降' : '抬高'} ${(Math.abs(minZ) * 100).toFixed(1)} cm（脚底 z=0）`);
+    }
+    standQpos = Float64Array.from(data.qpos);
+  }
+
+  setProgress(97, '初始化交互与 VR');
+  setupUI();
+  setupControls();
+  setupXR();
+  onResize();
+  window.addEventListener('resize', onResize);
+
+  renderer.shadowMap.needsUpdate = true;
+  renderer.setAnimationLoop(frame);
+
+  // 调试句柄：控制台里可直接 __elf.applyView('front') / __elf.camera / __elf.mjScene
+  window.__elf = {
+    THREE, renderer, scene, camera, controls, stage, mjScene, vrNav,
+    mujoco, model, data, applyView,
+    stats: () => mjScene && mjScene.stats,
+    get simulating() { return simulating; },
+  };
+
+  setProgress(100, '完成');
+  $('hud').classList.remove('hidden');
+  $('panel').classList.remove('hidden');
+  $('help').classList.remove('hidden');
+  setTimeout(() => elLoading.classList.add('hidden'), 260);
+}
+
+// ---------------------------------------------------------------- 交互
+function setupControls() {
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minDistance = 0.6;
+  controls.maxDistance = 40;
+  controls.maxPolarAngle = Math.PI * 0.495; // 不许钻到地面以下
+  controls.target.set(0.12, 0.78, 0);
+  controls.update();
+}
+
+function setupXR() {
+  const button = VRButton.createButton(renderer, {
+    optionalFeatures: ['local-floor', 'bounded-floor'],
+  });
+  button.id = 'vr-enter';
+  $('vr-slot').appendChild(button);
+
+  renderer.xr.addEventListener('sessionstart', () => {
+    toast('已进入 VR：左摇杆移动 · 右摇杆 30° 转向 · A/X 正对机器人', 4200);
+    controls.enabled = false;
+    renderer.shadowMap.needsUpdate = true;
+  });
+  renderer.xr.addEventListener('sessionend', () => {
+    controls.enabled = true;
+    renderer.shadowMap.needsUpdate = true;
+    applyView('front');
+  });
+
+  vrNav = new VRNav({ THREE, renderer, camera, scene, stage });
+  vrNav.init();
+}
+
+function setupUI() {
+  // 显示开关
+  const bind = (id, key) => {
+    const el = $(id);
+    el.addEventListener('change', () => {
+      mjScene.setOption(key, el.checked);
+      renderer.shadowMap.needsUpdate = true;
+    });
+  };
+  bind('opt-robot', 'showRobot');
+  bind('opt-stairs', 'showStairs');
+  bind('opt-floor', 'showFloor');
+  bind('opt-collision', 'showCollision');
+
+  const shadowEl = $('opt-shadow');
+  shadowEl.addEventListener('change', () => {
+    renderer.shadowMap.enabled = shadowEl.checked;
+    renderer.shadowMap.needsUpdate = true;
+    mjScene.applyOptions();
+  });
+
+  // 视角预设
+  $('views').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-view]');
+    if (btn) { applyView(btn.dataset.view); toast(`视角：${btn.textContent}`); }
+  });
+
+  // 物理开关
+  const simEl = $('opt-sim');
+  simEl.addEventListener('change', () => {
+    simulating = simEl.checked;
+    physicsAcc = 0;
+    renderer.shadowMap.autoUpdate = simulating; // 机器人动起来后阴影要跟着更新
+    renderer.shadowMap.needsUpdate = true;
+    if (!simulating && standQpos) {
+      // 关掉物理时回到静止站立姿态
+      data.qpos.set(standQpos);
+      mujoco.mj_forward(model, data);
+      mjScene.sync();
+    }
+    $('hud-mode').textContent = simulating ? '物理运行（无控制器）' : '静止站立';
+    toast(simulating ? '已开启 MuJoCo 物理：机器人会因重力倒地' : '已回到静止站立姿态');
+  });
+
+  $('btn-reset-pose').addEventListener('click', () => {
+    try {
+      mujoco.mj_resetData(model, data);
+      if (standQpos) data.qpos.set(standQpos);
+    } catch {
+      data.qpos.set(standQpos || model.qpos0);
+    }
+    mujoco.mj_forward(model, data);
+    mjScene.sync();
+    renderer.shadowMap.needsUpdate = true;
+    toast('已复位到初始站立姿态');
+  });
+
+  $('btn-reset-stage').addEventListener('click', () => {
+    if (vrNav) vrNav.resetStage();
+    toast('世界位置已复位');
+  });
+
+  $('panel-fold').addEventListener('click', () => $('panel').classList.toggle('folded'));
+
+  // HUD 信息
+  $('hud-model').textContent =
+    `${model.nbody} 刚体 · ${model.ngeom} 几何 · ${mjScene.stats.triangles.toLocaleString()} 面`;
+}
+
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  if (!renderer.xr.isPresenting) {
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  renderer.setSize(w, h, false);
+}
+
+// ---------------------------------------------------------------- 主循环
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.12);
+
+  if (simulating && model && data) {
+    physicsAcc += dt;
+    let steps = 0;
+    while (physicsAcc >= timestep && steps < CFG.maxPhysicsStepsPerFrame) {
+      mujoco.mj_step(model, data);
+      physicsAcc -= timestep;
+      steps++;
+    }
+    if (steps > 0) mjScene.sync();
+    if (physicsAcc > timestep * CFG.maxPhysicsStepsPerFrame) physicsAcc = 0;
+  }
+
+  if (vrNav) vrNav.update(dt);
+  if (controls && controls.enabled && !renderer.xr.isPresenting) controls.update();
+
+  renderer.render(scene, camera);
+
+  // FPS / 渲染统计
+  fpsAcc += dt; fpsFrames++;
+  if (fpsAcc >= 0.5) {
+    fps = fpsFrames / fpsAcc;
+    fpsAcc = 0; fpsFrames = 0;
+    const r = renderer.info.render;
+    $('hud-render').textContent =
+      `${fps.toFixed(0)} fps · ${(r.triangles / 1000).toFixed(0)}k 三角 · ${r.calls} 批次`;
+  }
+}
+
+boot().catch(fail);

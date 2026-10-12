@@ -53,6 +53,7 @@ export class MjScene {
       showFloor: true,
       showCollision: false,
     };
+    this.floorOpacity = 1;  // 地面网格不透明度（半透明 VR 透视时淡化，露出真实地面）
 
     this.stats = { geometries: 0, triangles: 0, drawn: 0 };
     this.disposables = [];
@@ -328,6 +329,26 @@ export class MjScene {
     if (!(key in this.opts)) return this;
     this.opts[key] = value;
     this.applyOptions();
+    return this;
+  }
+
+  /**
+   * 地面网格的不透明度（0~1）。
+   * 半透明 VR（透视）时调到 0.3 左右：虚拟网格仍给地面参照，但真实地面能透出来。
+   * 只作用于 worldbody 下的平面几何，机器人 / 楼梯材质不受影响。
+   * @param {number} value
+   */
+  setFloorOpacity(value) {
+    const o = Math.min(1, Math.max(0, Number(value)));
+    this.floorOpacity = o;
+    for (const gi of this.floorGeomIds) {
+      const mat = this.objs[gi]?.material;
+      if (!mat) continue;
+      mat.transparent = o < 0.999;
+      mat.opacity = o;
+      mat.depthWrite = o >= 0.999;   // 半透明时关掉深度写入，避免挡住身后物体
+      mat.needsUpdate = true;
+    }
     return this;
   }
 

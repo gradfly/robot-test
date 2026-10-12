@@ -70,6 +70,7 @@ node server.mjs
 | `--no-https` | 关闭 | 只开 HTTP，跳过证书生成（纯桌面预览时最省事） |
 | `--open` | 关闭 | 启动后自动用默认浏览器打开 |
 | `--open-path <path>` | `/` | `--open` 时打开的路径，如 `"/?motion=fight_policy"` 直接进运动仿真回放 |
+| `--log` | 关闭 | 在终端打印每条请求（排查加载问题时用） |
 
 ```bash
 node server.mjs --http-port 9000 --https-port 9443   # 换端口
@@ -132,7 +133,12 @@ python view_mujoco.py --drop   # 落地对齐：消除脚底悬空
 - **左键拖动** = 旋转 · **滚轮** = 缩放 · **右键拖动** = 平移
 - 右侧面板：显示开关（机器人 / 楼梯 / 地面 / 阴影 / 碰撞体）、6 个视角预设、  
   物理开关与复位按钮
-- 底部「VR NOT SUPPORTED」按钮在支持 XR 的设备上会变成 **ENTER VR**
+- 底部并排两个 XR 入口按钮（在不支持 XR 的设备上会显示为灰色不可用）：
+
+  | 按钮 | 模式 | 效果 |
+  | --- | --- | --- |
+  | **进入 VR** | `immersive-vr` | 沉浸式：虚拟世界完全遮住现实 |
+  | **半透明 VR** | `immersive-ar` | 透视（Passthrough）：背景透明，**能看到眼镜外的真实环境** |
 
 ---
 
@@ -194,7 +200,7 @@ python web/tools/bake_motion.py --stop-on tracking    # 改用 mjlab 严格跟�
    - ⚠️ 必须用 **https**（WebXR 的安全上下文要求），http 地址在头显里不会出现 ENTER VR。
 3. 首次打开会提示「证书不受信任」→ 选 **高级 → 继续访问**。  
    （想彻底免提示：把 `certs/cert.pem` 传到头显里安装为受信任证书。）
-4. 点页面下方的 **ENTER VR**。
+4. 点页面下方的 **进入 VR**（或 **半透明 VR**，见 4.1）。
 
 进入 VR 后：
 
@@ -208,6 +214,29 @@ python web/tools/bake_motion.py --stop-on tracking    # 改用 mjlab 严格跟�
 技术细节：参考空间用 `local-floor`，头显里**你的脚踩的地面**就是 MuJoCo 的  
 `z = 0` 地面。机器人身高约 1.43 m，站在离你 2.6 m 处，原地 1:1 比例观看，  
 可以走近绕一圈看细节。
+
+### 4.1 半透明 VR（透视 / Passthrough）
+
+「半透明 VR」按钮就在「进入 VR」旁边，点它进入的是 **WebXR 的 `immersive-ar`
+会话**：虚拟场景的背景不再渲染，没被机器人 / 地面遮住的地方直接透出头显摄像头
+拍到的真实房间 —— 机器人像站在你自己的客厅里打拳，你还是能看到沙发、桌子和走动
+的家人。
+
+| | 进入 VR | 半透明 VR |
+| --- | --- | --- |
+| 会话模式 | `immersive-vr` | `immersive-ar` |
+| 混合模式 | `opaque` | `alpha-blend`（设备上报） |
+| 背景 | 天空盒贴图（不透明） | 透明（`scene.background = null` + 清屏 alpha = 0） |
+| 地面网格 | 不透明 | 淡化到 0.3（真实地面能透出来，又保留位置参照） |
+| 手柄漫游 / A·X·B·Y | ✅ | ✅（完全一样） |
+
+实现要点（详见 §7.5）：渲染器必须带 alpha 通道；进入透视时摘掉天空盒与雾、
+清屏 alpha 置 0；退出会话时**全部还原**，不影响普通 VR / 桌面观感。
+
+> ⚠️ 透视需要头显有**彩色摄像头**：Quest 3 / Quest Pro / Quest 2（灰度透视）都可以；
+> Quest 1 没有，按钮会显示「透视不可用」。桌面浏览器不支持 `immersive-ar`，
+> 所以电脑上两个按钮都是灰色 —— 这是设备能力限制，不是页面坏了。
+> 首次进入时系统可能询问「允许使用摄像头 / 透视」，选允许即可。
 
 ---
 
@@ -237,11 +266,12 @@ web/
 │   ├── main.js           启动流程、渲染循环、UI、WebXR 会话、调试句柄 __elf
 │   ├── mjscene.js        MuJoCo（Z-up）→ three.js（Y-up）场景同步
 │   ├── motion.js         运动仿真回放：读 motion_*.bin，位置插值 + 四元数 slerp
-│   └── vrnav.js          WebXR 漫游：定位、摇杆移动、快速转向、跟随机器人
+│   ├── vrnav.js          WebXR 漫游：定位、摇杆移动、快速转向、跟随机器人
+│   └── xr.js             XR 入口按钮：进入 VR / 半透明 VR（透视），会话与背景合成
 ├── vendor/
 │   ├── mujoco.js/.wasm   MuJoCo 官方 WebAssembly 构建（simulate 版，含 mjv*）
 │   └── three.module.js   three.js r170
-├── jsm/                  three.js addons（OrbitControls / VRButton / RoomEnvironment）
+├── jsm/                  three.js addons（OrbitControls / RoomEnvironment）
 ├── assets/
 │   ├── elf3.xml          机器人模型（第 463 行 <include file="scene_bx.xml"/>）
 │   ├── scene_bx.xml      场景：地面 + 15 级台阶
@@ -295,13 +325,36 @@ MuJoCo 是 Z-up，three.js / WebXR 是 Y-up：
 相机固定在世界原点（由 three.js 用头显姿态驱动），**平移 / 旋转的是装着整个  
 MuJoCo 世界的 `stage` 组**，等价于世界坐标系漫游，不会和 XR 的头显位姿打架。
 
+### 7.5 半透明 VR（透视）是怎么实现的
+
+「看到眼镜外面」= WebXR 的 passthrough 合成，关键链条有四环，缺一不可：
+
+1. **WebGL 上下文带 alpha 通道**：`new THREE.WebGLRenderer({ alpha: true })`。
+   three 给 XR 会话建 `XRWebGLLayer` 时写死 `alpha: true`，但层缓冲的 alpha
+   能不能用，取决于上下文本身 —— 没有 alpha 通道就永远透不出去。
+2. **会话模式决定混合模式**：`environmentBlendMode` 是只读的，由 UA 按
+   `immersive-vr`（→ `opaque`）/ `immersive-ar`（→ `alpha-blend`）决定。
+   所以「半透明」必须走 `immersive-ar`，普通 VR 会话做不到。
+3. **别让虚拟背景填满画面**：three r170 的 `WebGLBackground` 在 alpha-blend 下
+   会把清屏 alpha 置 0，但 `scene.background` 若是贴图，会先画一个全屏四边形、
+   alpha 写成 1，现实就被盖住了 → 进入透视时把 `scene.background` 与
+   `scene.fog` 置 null（雾会把远处物体拉向雾色，透视下不合适）。
+4. **地面别挡住真实地面**：不透明的虚拟地板会把真实地板整个盖掉，
+   所以透视时把地面材质调成半透明（`MjScene.setFloorOpacity(0.3)`，
+   同时关 `depthWrite`），既保留位置参照又能看到真实地面。
+
+这些全部封装在 `js/xr.js` 的 `XRControls` 里（会话生命周期、参考空间探测、
+按钮状态、透视开关 `setSeeThrough()`），`main.js` 只在 `onEnter / onExit /
+onSeeThrough` 三个回调里接 UI。`setSeeThrough()` 幂等且不依赖真头显，
+`tools/verify.mjs` 直接调它做回归。
+
 ---
 
 ## 8. 工具（`tools/`）
 
 | 脚本                  | 用途                                                   |
 | ------------------- | ---------------------------------------------------- |
-| `verify.mjs`        | **端到端自检**：加载 / 模型 / UI / 开关 / 视角 / 物理 / 复位 / XR，24 项 |
+| `verify.mjs`        | **端到端自检**：加载 / 模型 / UI / 开关 / 视角 / 物理 / 复位 / XR / 半透明透视，45 项 |
 | `shoot.mjs`         | 用 CDP 等页面就绪后截图（可注入 JS 改相机、改可见性）                      |
 | `dump-geoms.mjs`    | 列出每个视觉网格的世界 AABB，用于和 MuJoCo 对账                       |
 | `make-manifest.mjs` | 重新生成 `assets/manifest.json`                          |
@@ -321,6 +374,12 @@ node tools/verify.mjs https://192.168.22.19:8443/   # 头显走的这条路
 ---
 
 ## 9. 常见问题
+
+**Q：点「半透明 VR」没反应 / 按钮是灰的？**  
+A：透视走的是 WebXR `immersive-ar`，需要**带彩色摄像头的头显**（Quest 2/3/Pro
+的浏览器都支持）。桌面 Chrome / 手机浏览器不支持，所以按钮显示「透视不可用」；
+Quest 1 没有彩色摄像头也不支持。另外首次进入时系统会请求「摄像头 / 透视」权限，
+拒绝了就进不去，可在头显的站点设置里重新允许。
 
 **Q：头显里打开页面没有 ENTER VR？**  
 A：① 必须用 https 地址；② 确认头显和电脑在同一局域网、能 ping 通；③  

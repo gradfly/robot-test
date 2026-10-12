@@ -104,15 +104,18 @@ try {
     return {mode:$('hud-mode').textContent.trim(),model:$('hud-model').textContent.trim(),
       hud:!$('hud').classList.contains('hidden'),panel:!$('panel').classList.contains('hidden'),
       help:!$('help').classList.contains('hidden'),loading:$('loading').classList.contains('hidden'),
-      vrBtn:!!document.getElementById('vr-enter'),
-      vrText:(document.getElementById('vr-enter')||{}).textContent||'',
+      xrBtns:[...document.querySelectorAll('#vr-slot button')].map(b=>({id:b.id,text:b.textContent.trim(),cls:b.className})),
       views:[...document.querySelectorAll('#views button')].map(b=>b.dataset.view),
       opts:[...document.querySelectorAll('#panel input[type=checkbox]')].map(i=>i.id),
       log:$('ld-log').textContent.trim().split('\\n').slice(0,8)};})()`);
   check('HUD 显示静止站立', ui.mode.includes('静止站立'), ui.mode);
   check('HUD 显示模型统计', /\d+ 刚体/.test(ui.model), ui.model);
   check('加载遮罩已隐藏 / 三个面板可见', ui.loading && ui.hud && ui.panel && ui.help);
-  check('VR 入口按钮已创建', ui.vrBtn, ui.vrText.replace(/\s+/g, ' '));
+  check('两个 XR 入口按钮已创建（进入 VR / 半透明 VR）',
+    ui.xrBtns.map((b) => b.id).join(',') === 'xr-vr,xr-ar', JSON.stringify(ui.xrBtns));
+  check('半透明 VR 按钮带独立样式类（磨砂玻璃观感）',
+    (ui.xrBtns.find((b) => b.id === 'xr-ar') || {}).cls === 'xr-btn xr-ar',
+    (ui.xrBtns.find((b) => b.id === 'xr-ar') || {}).cls);
   check('6 个视角预设齐全', ui.views.length === 6, ui.views.join(','));
   const wantOpts = ['opt-robot', 'opt-stairs', 'opt-floor', 'opt-shadow',
     'opt-collision', 'opt-sim', 'opt-follow'];
@@ -234,16 +237,53 @@ try {
     await new Promise(x=>setTimeout(x,800));return r.info.render.frame-a;})()`);
   check('渲染循环持续出帧', frames > 0, `800 ms 内 ${frames} 帧`);
 
-  // 7. XR 能力
-  const xr = await evalJs(ws, `(async()=>({
-    xrEnabled:__elf.renderer.xr.enabled,
-    immersiveVR: typeof navigator.xr!=='undefined' ? await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false) : 'no-navigator.xr',
-    refSpace: __elf.vrNav && __elf.vrNav.refSpaceType || null,
-    vrNavReady: !!__elf.vrNav && !!__elf.vrNav.renderer,
-  }))()`);
+  // 7. XR 能力 + 半透明 VR（透视）合成
+  const xr = await evalJs(ws, `(async()=>{
+    await new Promise(r=>setTimeout(r,800));   // 等 isSessionSupported 探测回来
+    const btns=[...document.querySelectorAll('#vr-slot button')].map(b=>({id:b.id,text:b.textContent.trim(),disabled:b.disabled}));
+    return {
+      xrEnabled:__elf.renderer.xr.enabled,
+      alpha: __elf.renderer.getContext().getContextAttributes().alpha,
+      caps: __elf.xrCapabilities(),
+      btns,
+      refSpace: __elf.vrNav && __elf.vrNav.refSpaceType || null,
+      vrNavReady: !!__elf.vrNav && !!__elf.vrNav.renderer,
+    };})()`);
   check('WebXR 已在渲染器上启用', xr.xrEnabled === true);
   check('VR 漫游模块已就绪', xr.vrNavReady === true, `参考空间: ${xr.refSpace}`);
-  console.log(`  （无头浏览器 immersive-vr 支持: ${JSON.stringify(xr.immersiveVR)} — 头显里这才是 true）`);
+  check('WebGL 带 alpha 通道（XR 帧缓冲透明的前提）', xr.alpha === true);
+  check('两个 XR 按钮的可用状态与设备能力一致',
+    xr.btns.length === 2 && xr.btns.every((b) => b.disabled === !xr.caps[b.id === 'xr-vr' ? 'vr' : 'ar']),
+    JSON.stringify(xr.btns) + ' / caps=' + JSON.stringify(xr.caps));
+  console.log(`  （无头浏览器能力探测: ${JSON.stringify(xr.caps)} — 头显里 vr/ar 才是 true）`);
+
+  // 7.5 半透明合成开关：不需要真头显也能验证（直接调 setSeeThrough）
+  const through = await evalJs(ws, `(()=>{
+    const r=__elf.renderer, s=__elf.scene, x=__elf.xr;
+    const F=__elf.mjScene.objs[__elf.mjScene.floorGeomIds[0]].material;
+    const b={bg:s.background, fog:s.fog, alpha:r.getClearAlpha(), floor:F.opacity};
+    x.setSeeThrough(true);
+    const on={bgNull:s.background===null, fogNull:s.fog===null, alpha:r.getClearAlpha(),
+              floor:+F.opacity.toFixed(3), transparent:F.transparent,
+              flag:x.through, getter:__elf.seeThrough};
+    x.setSeeThrough(false);
+    const off={bgBack:s.background===b.bg, fogBack:s.fog===b.fog, alpha:r.getClearAlpha(),
+               floor:+F.opacity.toFixed(3), transparent:F.transparent, flag:x.through,
+               hud:document.getElementById('hud-mode').textContent.trim()};
+    return {before:{bg:!!b.bg, fog:!!b.fog, alpha:b.alpha, floor:b.floor}, on, off};})()`);
+  check('半透明 VR：开启后摘掉背景贴图与雾（不再遮住现实）',
+    through.on.bgNull && through.on.fogNull, JSON.stringify(through.before));
+  check('半透明 VR：清屏 alpha 归零（XR 帧缓冲因此透明）',
+    through.on.alpha === 0, `alpha ${through.before.alpha} → ${through.on.alpha}`);
+  check('半透明 VR：地面网格淡化到 0.3（露出真实地面）',
+    Math.abs(through.on.floor - 0.3) < 1e-6 && through.on.transparent === true,
+    `opacity ${through.before.floor} → ${through.on.floor}`);
+  check('半透明 VR：状态标记与调试句柄同步',
+    through.on.flag === true && through.on.getter === true);
+  check('半透明 VR：关闭后背景 / 雾 / alpha / 地面全部还原',
+    through.off.bgBack && through.off.fogBack && through.off.alpha === through.before.alpha
+      && Math.abs(through.off.floor - 1) < 1e-6 && through.off.transparent === false,
+    JSON.stringify(through.off));
 
   // 8. URL 参数路径（一键脚本 start_vr_motion.bat / .sh 走的就是这条）
   const q = `${url}${url.includes('?') ? '&' : '?'}motion=fight_policy&speed=0.5&follow=0`;

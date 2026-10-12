@@ -13,12 +13,12 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import loadMujoco from '../vendor/mujoco.js';
 import { MjScene } from './mjscene.js';
 import { VRNav } from './vrnav.js';
 import { MotionPlayer } from './motion.js';
+import { XRControls } from './xr.js';
 
 // ---------------------------------------------------------------- 配置
 const CFG = {
@@ -29,6 +29,7 @@ const CFG = {
   defaultTimestep: 0.002,
   motionDefault: 'fight_policy',  // ?motion=1 时用的默认回放数据
   followLerp: 0.07,               // 桌面视角跟随的每秒收敛比例（每帧）
+  xrFloorOpacity: 0.3,            // 半透明 VR（透视）时地面网格的不透明度
 };
 
 // ---------------------------------------------------------------- DOM
@@ -138,7 +139,7 @@ function makeSkyTexture() {
 }
 
 // ---------------------------------------------------------------- 全局状态
-let renderer, scene, camera, controls, stage, mjScene, vrNav, mujoco, model, data;
+let renderer, scene, camera, controls, stage, mjScene, vrNav, xr, mujoco, model, data;
 let clock, simulating = false, physicsAcc = 0, timestep = CFG.defaultTimestep;
 let fpsAcc = 0, fpsFrames = 0, fps = 0;
 let standQpos = null; // 落地对齐后的静止站立姿态（复位用）
@@ -174,7 +175,10 @@ async function boot() {
   renderer = new THREE.WebGLRenderer({
     canvas,
     antialias: true,
-    alpha: false,
+    // alpha:true 是"半透明 VR（透视）"的前提：XR 帧缓冲带 alpha 通道，
+    // 清屏 alpha=0 的地方才能透出头显摄像头的真实画面。桌面观感不受影响
+    // （场景背景是天空盒贴图，始终不透明）。
+    alpha: true,
     powerPreference: 'high-performance',
   });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -306,11 +310,14 @@ async function boot() {
 
   // 调试句柄：控制台里可直接 __elf.applyView('front') / __elf.camera / __elf.mjScene
   window.__elf = {
-    THREE, renderer, scene, camera, controls, stage, mjScene, vrNav,
+    THREE, renderer, scene, camera, controls, stage, mjScene, vrNav, xr,
     mujoco, model, data, applyView, setMotion, restoreStandPose,
     stats: () => mjScene && mjScene.stats,
     get simulating() { return simulating; },
     get following() { return following; },
+    get xrMode() { return xr ? xr.active : null; },
+    get seeThrough() { return xr ? xr.through : false; },
+    xrCapabilities: () => (xr ? xr.capabilities() : null),
     get kinematicsName() { return kinematics === mujoco.mj_forward ? 'mj_forward' : 'mj_kinematics'; },
     getMotion: () => (motion ? {
       name: motionName, kind: motion.kind, label: motion.label,
@@ -372,7 +379,7 @@ async function setMotion(name, { hideStairs = true } = {}) {
     motion = null;
     restoreStandPose();
     $('hud-motion').textContent = '—';
-    $('hud-mode').textContent = simulating ? '物理运行（无控制器）' : '静止站立';
+    refreshHudMode();
     renderer.shadowMap.autoUpdate = simulating;
     $('motion-note').textContent =
       '回放数据由 tools/bake_motion.py 在本机跑一遍 MuJoCo 仿真后录制。';
@@ -416,7 +423,7 @@ async function setMotion(name, { hideStairs = true } = {}) {
 
   renderer.shadowMap.autoUpdate = true;
   renderer.shadowMap.needsUpdate = true;
-  $('hud-mode').textContent = '运动仿真回放';
+  refreshHudMode();
   $('hud-motion').textContent = motion.describe();
 
   const s = motion.meta.stats;
@@ -472,25 +479,48 @@ function setupControls() {
 }
 
 function setupXR() {
-  const button = VRButton.createButton(renderer, {
-    optionalFeatures: ['local-floor', 'bounded-floor'],
+  xr = new XRControls({
+    renderer,
+    scene,
+    slot: $('vr-slot'),
+    log,
+    toast,
+    onEnter: (id, info) => {
+      controls.enabled = false;
+      renderer.shadowMap.needsUpdate = true;
+      refreshHudMode();
+      toast(id === 'ar'
+        ? `半透明 VR 已开启：背景透明（${info.blend}），能看到眼镜外的真实环境`
+        : '已进入 VR：左摇杆移动 · 右摇杆 30° 转向 · A/X 正对机器人', 4600);
+    },
+    onExit: () => {
+      controls.enabled = true;
+      renderer.shadowMap.needsUpdate = true;
+      applyView('front');
+      refreshHudMode();
+    },
+    // 透视模式：地面网格淡化，真实地面透出来；退出时完全还原
+    onSeeThrough: (on) => {
+      if (mjScene) mjScene.setFloorOpacity(on ? CFG.xrFloorOpacity : 1);
+      renderer.shadowMap.needsUpdate = true;
+    },
   });
-  button.id = 'vr-enter';
-  $('vr-slot').appendChild(button);
-
-  renderer.xr.addEventListener('sessionstart', () => {
-    toast('已进入 VR：左摇杆移动 · 右摇杆 30° 转向 · A/X 正对机器人', 4200);
-    controls.enabled = false;
-    renderer.shadowMap.needsUpdate = true;
-  });
-  renderer.xr.addEventListener('sessionend', () => {
-    controls.enabled = true;
-    renderer.shadowMap.needsUpdate = true;
-    applyView('front');
-  });
+  xr.init();
 
   vrNav = new VRNav({ THREE, renderer, camera, scene, stage });
   vrNav.init();
+}
+
+/** HUD「状态」栏：XR 会话 > 回放 > 本地物理 > 静止站立（优先级从高到低） */
+function refreshHudMode() {
+  const el = $('hud-mode');
+  if (!el) return;
+  const mode = xr ? xr.active : null;
+  if (mode === 'ar') el.textContent = '半透明 VR（透视）';
+  else if (mode === 'vr') el.textContent = 'VR 沉浸观看';
+  else if (motion) el.textContent = '运动仿真回放';
+  else if (simulating) el.textContent = '物理运行（无控制器）';
+  else el.textContent = '静止站立';
 }
 
 function setupUI() {
@@ -558,7 +588,7 @@ function setupUI() {
       mujoco.mj_forward(model, data);
       mjScene.sync();
     }
-    $('hud-mode').textContent = simulating ? '物理运行（无控制器）' : '静止站立';
+    refreshHudMode();
     toast(simulating ? '已开启 MuJoCo 物理：机器人会因重力倒地' : '已回到静止站立姿态');
   });
 

@@ -197,6 +197,7 @@ html, body {
   bottom: 18px;
   transform: translateX(-50%);
   display: flex;
+  align-items: center;
   gap: 10px;
 }
 #vr-slot button {
@@ -204,15 +205,41 @@ html, body {
   letter-spacing: 0.8px;
   color: #06202e;
   background: linear-gradient(180deg, #7ef0c0, #41cf9a);
-  border: 0;
+  border: 1px solid transparent;
   border-radius: 10px;
-  padding: 12px 22px;
+  padding: 12px 20px;
   cursor: pointer;
+  white-space: nowrap;
   box-shadow: 0 8px 24px rgba(65, 207, 154, 0.32);
+  transition: filter 0.15s, background 0.15s, box-shadow 0.15s;
 }
-#vr-slot button:hover { filter: brightness(1.06); }
-#vr-slot button:active { transform: translateY(1px); }
-#vr-slot button[disabled] { cursor: default; }
+#vr-slot button:hover:not([disabled]) { filter: brightness(1.06); }
+#vr-slot button:active:not([disabled]) { transform: translateY(1px); }
+
+/* 半透明 VR（透视）：做成"磨砂玻璃"观感 —— 按钮本身就是半透明的，
+   一眼能看出这个入口会让眼镜看到外面 */
+#vr-slot button.xr-ar {
+  color: var(--fg);
+  background: rgba(84, 209, 255, 0.16);
+  border-color: rgba(84, 209, 255, 0.55);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(9px) saturate(140%);
+  -webkit-backdrop-filter: blur(9px) saturate(140%);
+}
+#vr-slot button.xr-ar:hover:not([disabled]) {
+  background: rgba(84, 209, 255, 0.28);
+  border-color: rgba(84, 209, 255, 0.8);
+  filter: none;
+}
+#vr-slot button[disabled] {
+  cursor: not-allowed;
+  opacity: 0.42;
+  filter: grayscale(0.35);
+  box-shadow: none;
+}
+#vr-slot button.active {
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.55), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
 #vr-slot a {
   display: inline-flex;
   align-items: center;

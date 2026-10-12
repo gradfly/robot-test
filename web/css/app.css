@@ -122,6 +122,31 @@ html, body {
 }
 .chk input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
 
+/* 带下拉框的一行（运动仿真：回放数据 / 倍速） */
+.rowsel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+.rowsel select {
+  flex: 0 0 148px;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--panel-line);
+  border-radius: 7px;
+  cursor: pointer;
+  outline: none;
+}
+.rowsel select:hover { border-color: rgba(84, 209, 255, 0.45); }
+.rowsel option { background: #10161f; color: var(--fg); }
+
 .btns { display: flex; flex-wrap: wrap; gap: 6px; }
 .btns button {
   flex: 1 1 auto;

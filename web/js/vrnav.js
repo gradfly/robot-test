@@ -31,6 +31,10 @@ export class VRNav {
     this.snapTurn = true;
     this.recenterDistance = 2.6;
     this.turnCooldown = 0;
+    this.follow = true;         // 回放时是否自动跟随机器人
+    this.robotWorld = new THREE.Vector3();  // 机器人当前世界位置（由 main.js 每帧更新）
+    // 舒适窗口：机器人在这个范围内就完全不动，避免和用户自己的摇杆移动打架
+    this.followWindow = { min: 1.7, max: 4.8, front: -0.25 };
 
     this.controllers = [];
     this._v1 = new THREE.Vector3();
@@ -126,13 +130,63 @@ export class VRNav {
     s.rotation.y += theta;
   }
 
-  /** 把机器人摆到用户正前方 D 米，并让它正面朝用户 */
-  recenterToRobot() {
+  /**
+   * 把机器人摆到用户正前方 D 米，并让它正面朝用户。
+   * @param {THREE.Vector3} [robotWorld] 机器人当前世界位置；不传就用 this.robotWorld。
+   *   机器人回放时会走到离世界原点好几米的地方，所以必须按它的**实际位置**摆位，
+   *   否则"正对机器人"按钮会把镜头对到空地上。
+   */
+  recenterToRobot(robotWorld) {
     const p = this.headPosition(this._v1);
     const f = this.headForwardXZ(this._v2);
     const s = this.stage;
-    s.rotation.set(0, Math.atan2(f.x, f.z), 0);
-    s.position.set(p.x + f.x * this.recenterDistance, 0, p.z + f.z * this.recenterDistance);
+    const yaw = Math.atan2(f.x, f.z);
+    const local = s.worldToLocal((robotWorld || this.robotWorld).clone());
+    const c = Math.cos(yaw);
+    const sn = Math.sin(yaw);
+    const lx = local.x * c + local.z * sn;   // R_y(yaw)·local 的水平分量
+    const lz = -local.x * sn + local.z * c;
+    s.rotation.set(0, yaw, 0);
+    s.position.set(p.x + f.x * this.recenterDistance - lx, 0,
+      p.z + f.z * this.recenterDistance - lz);
+    s.updateMatrixWorld(true);
+    return this;
+  }
+
+  /**
+   * 回放跟随：机器人跑出舒适窗口（太近 / 太远 / 绕到身后）时慢慢把它拉回正前方；
+   * 在窗口内什么都不做，用户照样可以用摇杆自由移动。
+   */
+  autoFollow(dt, robotWorld) {
+    if (!this.enabled || !this.follow) return;
+    if (!this.renderer.xr.isPresenting) return;
+    const w = robotWorld || this.robotWorld;
+    const p = this.headPosition(this._v1);
+    const f = this.headForwardXZ(this._v2);
+    const dx = w.x - p.x;
+    const dz = w.z - p.z;
+    const dist = Math.hypot(dx, dz);
+    const front = dist > 1e-6 ? (dx * f.x + dz * f.z) / dist : 1;
+    const win = this.followWindow;
+    if (dist >= win.min && dist <= win.max && front > win.front) return;
+
+    const yaw = Math.atan2(f.x, f.z);
+    const local = this.stage.worldToLocal(this._v3.copy(w));
+    const c = Math.cos(yaw);
+    const sn = Math.sin(yaw);
+    const lx = local.x * c + local.z * sn;
+    const lz = -local.x * sn + local.z * c;
+    const tx = p.x + f.x * this.recenterDistance - lx;
+    const tz = p.z + f.z * this.recenterDistance - lz;
+
+    const k = 1 - Math.pow(0.05, Math.min(dt, 0.1));   // ≈0.33 s 时间常数
+    const s = this.stage;
+    s.position.x += (tx - s.position.x) * k;
+    s.position.z += (tz - s.position.z) * k;
+    let dy = yaw - s.rotation.y;
+    while (dy > Math.PI) dy -= 2 * Math.PI;
+    while (dy < -Math.PI) dy += 2 * Math.PI;
+    s.rotation.y += dy * k;
     s.updateMatrixWorld(true);
     return this;
   }

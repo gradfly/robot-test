@@ -41,6 +41,7 @@
   </div>
   <dl>
     <div><dt>状态</dt><dd id="hud-mode">静止站立</dd></div>
+    <div><dt>回放</dt><dd id="hud-motion">—</dd></div>
     <div><dt>结构</dt><dd id="hud-model">—</dd></div>
     <div><dt>渲染</dt><dd id="hud-render">—</dd></div>
   </dl>
@@ -50,6 +51,29 @@
 <section id="panel" class="panel hidden">
   <button class="fold" id="panel-fold" title="折叠/展开">⚙</button>
   <div class="body">
+    <h2>运动仿真</h2>
+    <label class="rowsel"><span>回放</span>
+      <select id="opt-motion">
+        <option value="off">关闭（静止站立）</option>
+        <option value="fight_policy">策略仿真 · 打拳</option>
+        <option value="fight_ref">参考动作 · 打拳</option>
+      </select>
+    </label>
+    <label class="rowsel"><span>倍速</span>
+      <select id="opt-motion-speed">
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.5">1.5×</option>
+      </select>
+    </label>
+    <label class="chk"><input type="checkbox" id="opt-follow" checked /><span>视角跟随机器人</span></label>
+    <div class="btns">
+      <button id="btn-motion-restart">从头播放</button>
+      <button id="btn-motion-pause">暂停</button>
+    </div>
+    <p class="note" id="motion-note">回放数据由 <code>tools/bake_motion.py</code> 在本机跑一遍 MuJoCo 仿真后录制。</p>
+
     <h2>显示</h2>
     <label class="chk"><input type="checkbox" id="opt-robot" checked /><span>机器人</span></label>
     <label class="chk"><input type="checkbox" id="opt-stairs" checked /><span>楼梯 / 障碍</span></label>
@@ -79,6 +103,7 @@
   <div class="col">
     <h3>桌面</h3>
     <p>左键拖动 = 旋转 · 滚轮 = 缩放 · 右键拖动 = 平移</p>
+    <p>右侧「运动仿真」= 回放策略跟踪打拳的动作</p>
   </div>
   <div class="col">
     <h3>头显（Quest 等）</h3>

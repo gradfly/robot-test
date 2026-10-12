@@ -2,7 +2,9 @@
 
 在浏览器里跑**真正的 MuJoCo 物理引擎**（官方 WebAssembly 构建），把 `elf3.xml` +  
 `scene_bx.xml`（楼梯 / 地面）渲染成三维场景，并支持用 **VR 头显沉浸式观看**。  
-默认状态是**静止站立**：机器人保持 XML 里的初始位形，不跑物理。
+默认状态是**静止站立**：机器人保持 XML 里的初始位形，不跑物理。  
+也可以在网页 / VR 里回放**策略跑出来的运动仿真**（`elf3_play.py` 那条
+MuJoCo + `policy.onnx` 闭环、跟踪 `fight.npz` 打拳动作的画面）—— 见 §3。
 
 ---
 
@@ -30,6 +32,22 @@
 脚本会自动完成：定位 Node → 启动服务器（HTTP + HTTPS 双端口）→ 打开默认浏览器。
 **关闭那个命令行窗口即停止服务。**
 
+### 1.2.1 一键看「运动仿真」（推荐给 VR 观看）
+
+| 系统 | 操作 |
+| --- | --- |
+| Windows | 进入 `web/` 目录，**双击 `start_vr_motion.bat`** |
+| macOS / Linux | 进入 `web/` 目录，执行 `./start_vr_motion.sh` |
+
+它和 `start.bat` / `start.sh` **并存、互不覆盖**，区别是**直接进入运动仿真回放**：
+自动检查回放数据（缺了就本机跑一遍 MuJoCo 仿真录出来）→ 起服务器 → 打开的地址带
+`?motion=fight_policy`，所以一进页面就是机器人在打拳，VR 头显的地址也会一并打印。
+
+```bash
+./start_vr_motion.sh --rebake          # 重新跑一遍本机仿真，刷新回放数据
+./start_vr_motion.sh --https-port 9443 # 其它参数原样转给 server.mjs
+```
+
 ### 1.3 方式二：命令行启动
 
 ```bash
@@ -51,6 +69,7 @@ node server.mjs
 | `--https-port <n>` | `8443` | HTTPS 端口，VR 头显用 |
 | `--no-https` | 关闭 | 只开 HTTP，跳过证书生成（纯桌面预览时最省事） |
 | `--open` | 关闭 | 启动后自动用默认浏览器打开 |
+| `--open-path <path>` | `/` | `--open` 时打开的路径，如 `"/?motion=fight_policy"` 直接进运动仿真回放 |
 
 ```bash
 node server.mjs --http-port 9000 --https-port 9443   # 换端口
@@ -117,7 +136,57 @@ python view_mujoco.py --drop   # 落地对齐：消除脚底悬空
 
 ---
 
-## 3. VR 头显沉浸式观看
+## 3. 运动仿真回放（策略跟踪「打拳」动作）
+
+页面默认只摆位、不跑物理。右侧面板第一栏「运动仿真」可以把**策略跑出来的运动仿真**
+放到网页 / VR 里看 —— 也就是 `elf3_play.py` 那条链路（MuJoCo + `policy.onnx`
+跟踪 `fight.npz`）的画面。
+
+| 回放数据 | 内容 | 时长 |
+| --- | --- | --- |
+| 策略仿真 · 打拳 | 本机跑 **MuJoCo + policy.onnx** 闭环仿真录制的 qpos（含物理接触、关节跟踪） | 146.8 s |
+| 参考动作 · 打拳 | 直接取 `fight.npz` 里重定向后的运动（纯运动学，无物理） | 244.9 s |
+
+浏览器里的 MuJoCo WASM 没有策略网络（没有 onnxruntime），所以网页端**不现算策略**：
+先在本地把仿真跑一遍，把每个控制步（50 Hz）的 `qpos` 录成 float32 二进制
+（`assets/motion_*.bin` + 同名 `.json`），网页端按时间插值回放（位置线性插值、
+四元数最短路径 slerp），再用 `mj_kinematics` 刷新几何位姿 —— 50 Hz 数据 + 插值，
+VR 里动作平滑不抖。
+
+重新录制（换了模型 / 策略 / 动作数据之后）：
+
+```bash
+python web/tools/bake_motion.py                       # 整段录，约 20~40 s
+python web/tools/bake_motion.py --steps 1500          # 只录前 30 s
+python web/tools/bake_motion.py --only ref            # 只录参考动作
+python web/tools/bake_motion.py --stop-on tracking    # 改用 mjlab 严格跟踪判据截断
+```
+
+面板上的控件：
+
+| 控件 | 说明 |
+| --- | --- |
+| 回放 | 关闭（静止站立）/ 策略仿真 · 打拳 / 参考动作 · 打拳 |
+| 倍速 | 0.25× / 0.5× / 1× / 1.5× |
+| 视角跟随机器人 | 机器人会满场走动（世界坐标约 ±5 m），打开后镜头自动跟住它 |
+| 从头播放 / 暂停 | 控制回放进度（「复位姿态」在回放中也等价于从头播放） |
+
+几点说明：
+
+- 回放数据是**在平地上**录的，而网页场景里带 15 级台阶，所以开启回放时会自动把
+  「楼梯 / 障碍」关掉避免视觉穿模；想看台阶可以自己再勾回来。
+- 开启回放会**自动关掉「运行 MuJoCo 物理」**：两者互斥（一个是回放录好的 qpos，
+  一个是本地现算 `mj_step`）。
+- 策略在 t≈148 s 会失稳摔倒，所以录制在**最后一次姿态健康**的时刻截断
+  （倾角 < 30°、根高 > 0.80 m），回放里不会看到倒地画面。
+- VR 里的「视角跟随」是**舒适窗口式**的：机器人在 1.7 ~ 4.8 m 内且大致在身前就
+  完全不动，跑出这个范围才慢慢把它拉回正前方 —— 不会和你自己的摇杆移动打架。
+  A / X「把机器人摆到正前方」也按它的**实际位置**摆位（回放时它不在世界原点）。
+- URL 参数：`?motion=fight_policy&speed=0.5&follow=0`（一键脚本用的就是这条）。
+
+---
+
+## 4. VR 头显沉浸式观看
 
 1. **电脑和头显连同一个局域网**（同一个 Wi-Fi / 路由器）。
 2. 在头显浏览器里打开终端打印的 **HTTPS** 局域网地址，例如  
@@ -142,7 +211,7 @@ python view_mujoco.py --drop   # 落地对齐：消除脚底悬空
 
 ---
 
-## 4. 界面功能
+## 5. 界面功能
 
 | 控件           | 说明                                          |
 | ------------ | ------------------------------------------- |
@@ -158,7 +227,7 @@ python view_mujoco.py --drop   # 落地对齐：消除脚底悬空
 
 ---
 
-## 5. 目录结构
+## 6. 目录结构
 
 ```
 web/
@@ -167,7 +236,8 @@ web/
 ├── js/
 │   ├── main.js           启动流程、渲染循环、UI、WebXR 会话、调试句柄 __elf
 │   ├── mjscene.js        MuJoCo（Z-up）→ three.js（Y-up）场景同步
-│   └── vrnav.js          WebXR 漫游：定位、摇杆移动、快速转向
+│   ├── motion.js         运动仿真回放：读 motion_*.bin，位置插值 + 四元数 slerp
+│   └── vrnav.js          WebXR 漫游：定位、摇杆移动、快速转向、跟随机器人
 ├── vendor/
 │   ├── mujoco.js/.wasm   MuJoCo 官方 WebAssembly 构建（simulate 版，含 mjv*）
 │   └── three.module.js   three.js r170
@@ -176,18 +246,21 @@ web/
 │   ├── elf3.xml          机器人模型（第 463 行 <include file="scene_bx.xml"/>）
 │   ├── scene_bx.xml      场景：地面 + 15 级台阶
 │   ├── meshes/*.STL      34 个网格
-│   └── manifest.json     资源清单（加载进度用）
+│   ├── motion_fight_policy.bin/.json   策略仿真回放数据（bake_motion.py 生成）
+│   ├── motion_fight_ref.bin/.json      参考动作回放数据
+│   └── manifest.json     资源清单（加载进度用；不含回放数据）
 ├── certs/                自签证书（首次启动自动生成）
 ├── server.mjs            本地服务器：HTTP + HTTPS 双监听
-├── start.bat / start.sh  一键启动
-└── tools/                构建 / 调试工具（见下）
+├── start.bat / start.sh               一键启动（静止站立查看）
+├── start_vr_motion.bat / .sh          一键启动 + 自动进入运动仿真回放
+└── tools/                构建 / 调试工具（见 §8）
 ```
 
 ---
 
-## 6. 实现要点（踩过的坑）
+## 7. 实现要点（踩过的坑）
 
-### 6.1 网格顶点必须用 MuJoCo 编译后的数据
+### 7.1 网格顶点必须用 MuJoCo 编译后的数据
 
 MuJoCo 编译 STL 时会把顶点**重心归零**，偏移量记在 `model.mesh_pos` 里  
 （例如大腿 `l_hip_z_link` 的 `mesh_pos.z = -0.2229`）。
@@ -199,7 +272,7 @@ MuJoCo 编译 STL 时会把顶点**重心归零**，偏移量记在 `model.mesh_
 （已经做过重心归零，和 MuJoCo 内部渲染逐顶点一致），再用 `data.geom_xpos` /  
 `data.geom_xmat` 定位。这样也不需要在前端解析 STL。
 
-### 6.2 坐标映射
+### 7.2 坐标映射
 
 MuJoCo 是 Z-up，three.js / WebXR 是 Y-up：
 
@@ -209,7 +282,7 @@ MuJoCo 是 Z-up，three.js / WebXR 是 Y-up：
   yaw .rotation.y = +π/2      机器人正面（MuJoCo +x）朝向 three 的 -Z
 ```
 
-### 6.3 姿态与落地对齐
+### 7.3 姿态与落地对齐
 
 - 静止站立 = `mj_forward` 后把 `data.geom_xpos/geom_xmat` 一次性写进 three.js 对象，  
   默认**不跑物理**（`renderer.shadowMap.autoUpdate = false`，省开销）。
@@ -217,14 +290,14 @@ MuJoCo 是 Z-up，three.js / WebXR 是 Y-up：
   所以加载时按视觉网格最低点自动对齐一次，让脚底正好落在 `z = 0`。  
   复位按钮用的也是这个对齐后的姿态。
 
-### 6.4 VR 里的漫游
+### 7.4 VR 里的漫游
 
 相机固定在世界原点（由 three.js 用头显姿态驱动），**平移 / 旋转的是装着整个  
 MuJoCo 世界的 `stage` 组**，等价于世界坐标系漫游，不会和 XR 的头显位姿打架。
 
 ---
 
-## 7. 工具（`tools/`）
+## 8. 工具（`tools/`）
 
 | 脚本                  | 用途                                                   |
 | ------------------- | ---------------------------------------------------- |
@@ -232,6 +305,7 @@ MuJoCo 世界的 `stage` 组**，等价于世界坐标系漫游，不会和 XR �
 | `shoot.mjs`         | 用 CDP 等页面就绪后截图（可注入 JS 改相机、改可见性）                      |
 | `dump-geoms.mjs`    | 列出每个视觉网格的世界 AABB，用于和 MuJoCo 对账                       |
 | `make-manifest.mjs` | 重新生成 `assets/manifest.json`                          |
+| `bake_motion.py`    | 本机跑 MuJoCo + `policy.onnx`，把每步 qpos 录成 `assets/motion_*.bin` |
 | `fetch-three.mjs`   | 下载 three.js 与 addons                                 |
 | `selfsign.mjs`      | 纯 JS 生成自签证书（无 openssl 依赖，SAN 含本机所有内网 IP）             |
 | `make-cert.mjs`     | 证书生成的封装                                              |
@@ -246,7 +320,7 @@ node tools/verify.mjs https://192.168.22.19:8443/   # 头显走的这条路
 
 ---
 
-## 8. 常见问题
+## 9. 常见问题
 
 **Q：头显里打开页面没有 ENTER VR？**  
 A：① 必须用 https 地址；② 确认头显和电脑在同一局域网、能 ping 通；③  
@@ -262,6 +336,10 @@ A：删除 `certs/` 目录后重启服务器，会按当前 IP 重新生成证�
 **Q：加载很慢？**  
 A：首次要下载约 10 MB 的 MuJoCo WASM + 约 12 MB 的 STL 网格，之后浏览器会缓存。  
 加载页有进度条和实时日志。
+
+**Q：面板里选「策略仿真 · 打拳」提示"加载失败"？**  
+A：缺 `assets/motion_fight_policy.bin`。跑一次 `python web/tools/bake_motion.py`
+生成即可（或直接用 `start_vr_motion.bat` / `.sh`，它会自动补上）。
 
 **Q：页面显示"启动失败"？**  
 A：加载层会直接打印错误信息。常见原因是资源没就位——确认是在 `web/` 目录下、  

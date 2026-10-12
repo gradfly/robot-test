@@ -13,6 +13,8 @@
 | --- | --- |
 | **一键（Windows）** | 双击 **`web/start.bat`** |
 | **一键（macOS / Linux）** | `cd web && ./start.sh` |
+| **一键看运动仿真（Windows）** | 双击 **`web/start_vr_motion.bat`** |
+| **一键看运动仿真（macOS / Linux）** | `cd web && ./start_vr_motion.sh` |
 | **命令行** | `cd web && node server.mjs --open` |
 
 启动后：
@@ -22,6 +24,11 @@
 
 > 只需 **Node.js 18+**（仅用于起静态服务器，不装任何 npm 依赖）。
 > 关闭命令行窗口，或按 `Ctrl+C` 即停止服务。
+>
+> `start_vr_motion.*` 与 `start.bat` / `start.sh` **并存、互不覆盖**：它把
+> `elf3_play.py` 那条 MuJoCo + `policy.onnx` 的仿真在本机录成 qpos 序列，再让网页端
+> **回放**（浏览器里的 MuJoCo WASM 没有策略网络，所以策略在本地算、画面在网页放），
+> 一进页面就是机器人打拳，VR 头显地址也会一并打印。
 
 完整的启动说明、命令行参数、停止方式、启动失败排查，见
 **[`web/README.md`](web/README.md) 第 1 节「启动本地仿真界面」**。
@@ -91,6 +98,9 @@ python elf3_play.py --policy onnx --viewer native
 | 文件 / 目录 | 说明 |
 | --- | --- |
 | `web/` | **网页端仿真 + VR 观看工程**（启动入口在这里） |
+| `web/start_vr_motion.bat` `.sh` | **一键进入「运动仿真回放」**（不覆盖 `start.bat` / `start.sh`） |
+| `web/tools/bake_motion.py` | 本机跑 MuJoCo + `policy.onnx`，把每步 qpos 录成 `web/assets/motion_*.bin` |
+| `web/assets/motion_fight_*.bin/.json` | 网页端回放数据：`policy`=策略仿真（146.8 s）、`ref`=参考动作（244.9 s） |
 | `elf3_play.py` | **RL 策略仿真**：纯 MuJoCo 复刻 play.py，跑通普通任务 + motion-tracking |
 | `elf3_check.py` | 逆向链路的一致性回归校验 |
 | `fight.npz` | 参考动作数据（12244 帧 @ 50 Hz，29 关节 + 13 跟踪 body） |

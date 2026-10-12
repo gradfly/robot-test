@@ -3,6 +3,13 @@
  *
  * 流程：加载 MuJoCo WASM → 把 XML/STL 灌进虚拟文件系统 → 编译模型 →
  *       用 data.geom_xpos/geom_xmat 驱动 three.js 场景 → 静止站立（默认）或实时物理
+ *
+ * 三种"看什么"：
+ *   1) 静止站立（默认）：mj_forward 一次，机器人保持装配姿态；
+ *   2) 运动仿真回放：读 web/assets/motion_*.bin（本机用 tools/bake_motion.py
+ *      跑 MuJoCo + policy.onnx 闭环录下来的 qpos 序列），按时间插值写回 data.qpos，
+ *      再 mj_kinematics 刷新几何位姿 → 就是"策略跟踪打拳动作"的仿真画面，VR 里也能看；
+ *   3) 本地物理（可选）：直接跑 mj_step，无控制器，机器人会倒地（演示物理用）。
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -11,6 +18,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import loadMujoco from '../vendor/mujoco.js';
 import { MjScene } from './mjscene.js';
 import { VRNav } from './vrnav.js';
+import { MotionPlayer } from './motion.js';
 
 // ---------------------------------------------------------------- 配置
 const CFG = {
@@ -19,6 +27,8 @@ const CFG = {
   fetchConcurrency: 6,
   maxPhysicsStepsPerFrame: 24,
   defaultTimestep: 0.002,
+  motionDefault: 'fight_policy',  // ?motion=1 时用的默认回放数据
+  followLerp: 0.07,               // 桌面视角跟随的每秒收敛比例（每帧）
 };
 
 // ---------------------------------------------------------------- DOM
@@ -132,6 +142,13 @@ let renderer, scene, camera, controls, stage, mjScene, vrNav, mujoco, model, dat
 let clock, simulating = false, physicsAcc = 0, timestep = CFG.defaultTimestep;
 let fpsAcc = 0, fpsFrames = 0, fps = 0;
 let standQpos = null; // 落地对齐后的静止站立姿态（复位用）
+let kinematics = null; // 回放用的前向计算（优先 mj_kinematics，比 mj_forward 省掉碰撞检测）
+let motion = null;     // 当前回放（MotionPlayer）
+let motionName = 'off';
+let following = true;  // 视角是否跟随机器人
+let motionHudAcc = 0;
+const _vRobot = new THREE.Vector3();
+const _vDelta = new THREE.Vector3();
 
 const VIEWS = {
   front: { pos: [0.0, 1.30, 2.75], target: [0, 0.95, 0] },
@@ -258,6 +275,10 @@ async function boot() {
   stage.add(mjScene.wrapZUp());
   log(`· 网格三角面 ${mjScene.stats.triangles.toLocaleString()} 个 / 几何体 ${mjScene.stats.geometries} 个`);
 
+  // 回放时只需要几何位姿：mj_kinematics 不跑碰撞/约束，比 mj_forward 便宜很多
+  kinematics = (typeof mujoco.mj_kinematics === 'function') ? mujoco.mj_kinematics : mujoco.mj_forward;
+  log(`· 回放前向计算：${kinematics === mujoco.mj_forward ? 'mj_forward（该构建未导出 mj_kinematics）' : 'mj_kinematics'}`);
+
   // 站立姿态落地对齐：模型初始 free joint 高度让脚底略低于 z=0，
   // 这里按视觉网格最低点整体抬到底面正好贴地，避免脚陷进地板。
   {
@@ -278,15 +299,26 @@ async function boot() {
   onResize();
   window.addEventListener('resize', onResize);
 
+  await applyMotionFromQuery();     // 默认不开回放；URL 带 ?motion=… 时自动进入
+
   renderer.shadowMap.needsUpdate = true;
   renderer.setAnimationLoop(frame);
 
   // 调试句柄：控制台里可直接 __elf.applyView('front') / __elf.camera / __elf.mjScene
   window.__elf = {
     THREE, renderer, scene, camera, controls, stage, mjScene, vrNav,
-    mujoco, model, data, applyView,
+    mujoco, model, data, applyView, setMotion, restoreStandPose,
     stats: () => mjScene && mjScene.stats,
     get simulating() { return simulating; },
+    get following() { return following; },
+    get kinematicsName() { return kinematics === mujoco.mj_forward ? 'mj_forward' : 'mj_kinematics'; },
+    getMotion: () => (motion ? {
+      name: motionName, kind: motion.kind, label: motion.label,
+      nframes: motion.nframes, nq: motion.nq, fps: motion.fps,
+      duration: +motion.duration.toFixed(3), time: +motion.time.toFixed(3),
+      speed: motion.speed, paused: motion.paused,
+      stats: motion.meta.stats || null,
+    } : { name: motionName, kind: null }),
   };
 
   setProgress(100, '完成');
@@ -294,6 +326,137 @@ async function boot() {
   $('panel').classList.remove('hidden');
   $('help').classList.remove('hidden');
   setTimeout(() => elLoading.classList.add('hidden'), 260);
+}
+
+// ---------------------------------------------------------------- 运动仿真回放
+/** URL 参数：?motion=<off|fight_policy|fight_ref|1> &speed=0.5 &follow=0/1 */
+async function applyMotionFromQuery() {
+  const q = new URLSearchParams(location.search);
+  const speed = q.get('speed');
+  const follow = q.get('follow');
+  if (speed) {
+    const el = $('opt-motion-speed');
+    if ([...el.options].some((o) => o.value === speed)) el.value = speed;
+  }
+  if (follow !== null) {
+    following = !(follow === '0' || follow === 'false');
+    $('opt-follow').checked = following;
+    if (vrNav) vrNav.follow = following;
+  }
+  const m = q.get('motion');
+  if (m === null) return null;                    // 不带参数 → 保持原来的静止站立
+  const name = (m === '' || m === '1' || m === 'on') ? CFG.motionDefault : m;
+  if (name === 'off') return null;
+  return setMotion(name);
+}
+
+/** 恢复静止站立姿态（落地对齐后的 qpos） */
+function restoreStandPose() {
+  if (!model || !data) return;
+  if (standQpos) data.qpos.set(standQpos);
+  mujoco.mj_forward(model, data);
+  mjScene.sync();
+  renderer.shadowMap.needsUpdate = true;
+}
+
+/**
+ * 切换回放数据（'off' = 关闭）。
+ * 回放与本地 mj_step 物理互斥：开回放会自动关掉物理开关。
+ */
+async function setMotion(name, { hideStairs = true } = {}) {
+  const sel = $('opt-motion');
+  if (sel && sel.value !== name) sel.value = name;
+  motionName = name;
+
+  if (name === 'off' || !name) {
+    motion = null;
+    restoreStandPose();
+    $('hud-motion').textContent = '—';
+    $('hud-mode').textContent = simulating ? '物理运行（无控制器）' : '静止站立';
+    renderer.shadowMap.autoUpdate = simulating;
+    $('motion-note').textContent =
+      '回放数据由 tools/bake_motion.py 在本机跑一遍 MuJoCo 仿真后录制。';
+    return null;
+  }
+
+  if (simulating) {                                // 与本地物理互斥
+    const el = $('opt-sim');
+    el.checked = false;
+    el.dispatchEvent(new Event('change'));
+  }
+
+  $('motion-note').textContent = '正在加载回放数据…';
+  let player;
+  try {
+    player = await MotionPlayer.load(CFG.assetsBase, name);
+    if (player.nq !== data.qpos.length) {
+      throw new Error(`数据 nq=${player.nq} 与模型 nq=${data.qpos.length} 不一致`);
+    }
+  } catch (e) {
+    motion = null;
+    motionName = 'off';
+    if (sel) sel.value = 'off';
+    $('hud-motion').textContent = '—';
+    $('motion-note').innerHTML = `加载失败：${e.message}<br>`
+      + '先在项目根目录跑 <code>python web/tools/bake_motion.py</code> 生成回放数据。';
+    toast(`回放数据加载失败：${e.message}`, 4200);
+    return null;
+  }
+
+  motion = player;
+  motion.speed = Number($('opt-motion-speed').value) || 1;
+  motion.restart();
+  $('btn-motion-pause').textContent = '暂停';
+
+  // 录制的策略仿真是在平地上跑的；网页场景里的楼梯只是静态摆设，隐藏掉避免视觉穿模
+  if (hideStairs) {
+    const st = $('opt-stairs');
+    if (st.checked) { st.checked = false; st.dispatchEvent(new Event('change')); }
+  }
+
+  renderer.shadowMap.autoUpdate = true;
+  renderer.shadowMap.needsUpdate = true;
+  $('hud-mode').textContent = '运动仿真回放';
+  $('hud-motion').textContent = motion.describe();
+
+  const s = motion.meta.stats;
+  $('motion-note').innerHTML = (motion.kind === 'ref'
+    ? '参考动作：<code>fight.npz</code> 里重定向后的运动，纯运动学装配（无物理）。'
+    : '策略仿真：本机跑 MuJoCo + <code>policy.onnx</code> 闭环录制。'
+      + (s ? `跟踪误差：均值 ${s.anchorErrMean} m / 最大 ${s.anchorErrMax} m，`
+        + `躯干最大倾角 ${s.tiltMax}°。` : ''))
+    + `<br>${motion.nframes} 帧 @ ${motion.fps} fps = ${motion.duration.toFixed(1)} s。`;
+  toast(`已载入回放：${motion.label}`);
+  log(`· 回放数据 ${name}：${motion.nframes} 帧 / ${motion.duration.toFixed(1)} s`);
+  return motion;
+}
+
+/**
+ * 机器人视觉中心（three 世界坐标），用于视角跟随 / VR 正对。
+ * 注意：robotBounds() 给的是 MuJoCo 世界坐标，而 wrapZUp 那两层 Group
+ * （rotation.x=-π/2 再 rotation.y=+π/2）**已经**完成了 Z-up→Y-up 的映射，
+ * 所以这里直接 localToWorld，千万不要再手动换轴（会把目标点算到地面以下）。
+ */
+function robotCenterWorld(out) {
+  const c = mjScene.robotBounds().getCenter(out);   // MuJoCo 世界坐标
+  return mjScene.root.localToWorld(c);              // → three 世界坐标（含 stage 平移/旋转）
+}
+
+/** 每帧：让视角跟着机器人（桌面=平移相机，VR=交给 VRNav 舒适跟随） */
+function updateMotionCamera(dt) {
+  const c = robotCenterWorld(_vRobot);
+  if (vrNav) {
+    vrNav.robotWorld.copy(c);
+    if (following) vrNav.autoFollow(dt);
+    if (renderer.xr.isPresenting) return;
+  }
+  if (!following) return;
+  _vDelta.copy(c).sub(controls.target).multiplyScalar(CFG.followLerp);
+  if (_vDelta.lengthSq() > 1e-10) {
+    controls.target.add(_vDelta);
+    camera.position.add(_vDelta);
+    controls.update();
+  }
 }
 
 // ---------------------------------------------------------------- 交互
@@ -331,6 +494,30 @@ function setupXR() {
 }
 
 function setupUI() {
+  // 运动仿真回放
+  $('opt-motion').addEventListener('change', () => { setMotion($('opt-motion').value); });
+  $('opt-motion-speed').addEventListener('change', () => {
+    if (motion) motion.speed = Number($('opt-motion-speed').value) || 1;
+  });
+  $('opt-follow').addEventListener('change', () => {
+    following = $('opt-follow').checked;
+    if (vrNav) vrNav.follow = following;
+    toast(following ? '视角会跟着机器人走' : '已关闭视角跟随');
+  });
+  $('btn-motion-restart').addEventListener('click', () => {
+    if (!motion) { toast('先在「回放」里选一段运动数据'); return; }
+    motion.restart();
+    motion.paused = false;
+    $('btn-motion-pause').textContent = '暂停';
+    toast('已从头播放');
+  });
+  $('btn-motion-pause').addEventListener('click', () => {
+    if (!motion) { toast('先在「回放」里选一段运动数据'); return; }
+    motion.paused = !motion.paused;
+    $('btn-motion-pause').textContent = motion.paused ? '继续' : '暂停';
+    toast(motion.paused ? '回放已暂停' : '继续播放');
+  });
+
   // 显示开关
   const bind = (id, key) => {
     const el = $(id);
@@ -362,7 +549,8 @@ function setupUI() {
   simEl.addEventListener('change', () => {
     simulating = simEl.checked;
     physicsAcc = 0;
-    renderer.shadowMap.autoUpdate = simulating; // 机器人动起来后阴影要跟着更新
+    if (simulating && motion) setMotion('off');      // 与回放互斥
+    renderer.shadowMap.autoUpdate = simulating || !!motion; // 机器人动起来后阴影要跟着更新
     renderer.shadowMap.needsUpdate = true;
     if (!simulating && standQpos) {
       // 关掉物理时回到静止站立姿态
@@ -375,6 +563,13 @@ function setupUI() {
   });
 
   $('btn-reset-pose').addEventListener('click', () => {
+    if (motion) {                                    // 回放中 → 回到视频开头
+      motion.restart();
+      motion.paused = false;
+      $('btn-motion-pause').textContent = '暂停';
+      toast('回放已从头开始');
+      return;
+    }
     try {
       mujoco.mj_resetData(model, data);
       if (standQpos) data.qpos.set(standQpos);
@@ -412,7 +607,19 @@ function onResize() {
 function frame() {
   const dt = Math.min(clock.getDelta(), 0.12);
 
-  if (simulating && model && data) {
+  if (motion) {
+    // 运动仿真回放：按时间插值写回 qpos → 刷新几何位姿 → 同步 three.js
+    motion.advance(dt);
+    motion.writeQpos(data.qpos);
+    kinematics(model, data);
+    mjScene.sync();
+    updateMotionCamera(dt);
+    motionHudAcc += dt;
+    if (motionHudAcc >= 0.2) {
+      motionHudAcc = 0;
+      $('hud-motion').textContent = motion.describe();
+    }
+  } else if (simulating && model && data) {
     physicsAcc += dt;
     let steps = 0;
     while (physicsAcc >= timestep && steps < CFG.maxPhysicsStepsPerFrame) {

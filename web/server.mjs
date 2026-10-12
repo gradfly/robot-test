@@ -11,6 +11,7 @@
  *   node server.mjs --http-port 8080 --https-port 8443
  *   node server.mjs --no-https
  *   node server.mjs --open
+ *   node server.mjs --open --open-path "/?motion=fight_policy"   # 直接进运动仿真回放
  */
 import http from 'node:http';
 import https from 'node:https';
@@ -36,6 +37,9 @@ const HTTP_PORT = Number(arg('http-port', 8080));
 const HTTPS_PORT = Number(arg('https-port', 8443));
 const USE_HTTPS = !process.argv.includes('--no-https');
 const OPEN_BROWSER = process.argv.includes('--open');
+// --open 时打开的路径（默认首页）；例如 --open-path "/?motion=fight_policy"
+const OPEN_PATH = String(arg('open-path', '/')) || '/';
+const LOG_REQ = process.argv.includes('--log');   // 打印每条请求（排查加载问题时用）
 
 // ------------------------------------------------------------------ MIME
 const MIME = {
@@ -82,6 +86,11 @@ function handle(req, res) {
       return;
     }
     const ext = path.extname(filePath).toLowerCase();
+    if (LOG_REQ) {
+      res.on('finish', () => {
+        console.log(`  ${req.method} ${pathname} → ${res.statusCode} (${st.size} B)`);
+      });
+    }
     const headers = {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Content-Length': st.size,
@@ -160,15 +169,17 @@ if (USE_HTTPS) {
 }
 
 const ips = localIPv4();
+// 打印时带上 --open-path（例如 /?motion=fight_policy），头显里可直接照抄这条地址
+const openSuffix = OPEN_PATH === '/' ? '/' : OPEN_PATH;
 console.log(`\n  本机桌面浏览器：`);
-console.log(`     http://localhost:${httpPort}/`);
-if (httpsPort) console.log(`     https://localhost:${httpsPort}/`);
+console.log(`     http://localhost:${httpPort}${openSuffix}`);
+if (httpsPort) console.log(`     https://localhost:${httpsPort}${openSuffix}`);
 
 if (ips.length) {
   console.log(`\n  VR 头显（同一局域网内在头显浏览器打开）：`);
   for (const ip of ips) {
-    if (httpsPort) console.log(`     https://${ip}:${httpsPort}/`);
-    else console.log(`     http://${ip}:${httpPort}/   （⚠ 非 HTTPS，头显无法进入 VR）`);
+    if (httpsPort) console.log(`     https://${ip}:${httpsPort}${openSuffix}`);
+    else console.log(`     http://${ip}:${httpPort}${openSuffix}   （⚠ 非 HTTPS，头显无法进入 VR）`);
   }
   if (httpsPort) {
     console.log(`\n  首次打开会提示证书不受信任 —— 选择“高级 → 继续访问”即可；`);
@@ -178,7 +189,7 @@ if (ips.length) {
 console.log(`\n  Ctrl+C 停止服务。\n${line}\n`);
 
 if (OPEN_BROWSER) {
-  const url = `http://localhost:${httpPort}/`;
+  const url = new URL(OPEN_PATH, `http://localhost:${httpPort}/`).href;
   const cmd = process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
     : process.platform === 'darwin' ? ['open', [url]]
       : ['xdg-open', [url]];

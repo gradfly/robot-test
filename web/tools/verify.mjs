@@ -114,7 +114,11 @@ try {
   check('加载遮罩已隐藏 / 三个面板可见', ui.loading && ui.hud && ui.panel && ui.help);
   check('VR 入口按钮已创建', ui.vrBtn, ui.vrText.replace(/\s+/g, ' '));
   check('6 个视角预设齐全', ui.views.length === 6, ui.views.join(','));
-  check('6 个显示/物理开关齐全', ui.opts.length === 6, ui.opts.join(','));
+  const wantOpts = ['opt-robot', 'opt-stairs', 'opt-floor', 'opt-shadow',
+    'opt-collision', 'opt-sim', 'opt-follow'];
+  check('显示/物理/跟随开关齐全', wantOpts.every((id) => ui.opts.includes(id)), ui.opts.join(','));
+  check('运动仿真控件齐全（回放/倍速/暂停）',
+    !!(await evalJs(ws, `!!(document.getElementById('opt-motion')&&document.getElementById('opt-motion-speed')&&document.getElementById('btn-motion-pause')&&document.getElementById('btn-motion-restart'))`)));
   console.log('  加载日志:'); for (const l of ui.log) console.log('    ' + l);
 
   // 3. 显示开关
@@ -172,6 +176,59 @@ try {
       toast:document.getElementById('toast').textContent};})()`);
   check('“复位姿态”按钮可用', reset.qpos.every(Number.isFinite), JSON.stringify(reset.qpos));
 
+  // 5.5 运动仿真回放
+  const mo = await evalJs(ws, `(async()=>{
+    const before = { nq: __elf.data.qpos.length, stairs: __elf.mjScene.opts.showStairs,
+                     mode: document.getElementById('hud-mode').textContent.trim() };
+    const r = await __elf.setMotion('fight_policy');
+    const s0 = __elf.getMotion();
+    const q0 = Array.from(__elf.data.qpos);
+    await new Promise(x=>setTimeout(x,1200));
+    const q1 = Array.from(__elf.data.qpos);
+    return { loaded: !!r, s0, before, kinematics: __elf.kinematicsName,
+      moved: q0.some((v,i)=>Math.abs(v-q1[i])>1e-4),
+      movedBy: +Math.max(...q0.map((v,i)=>Math.abs(v-q1[i]))).toFixed(4),
+      stairsAfter: __elf.mjScene.opts.showStairs,
+      simChecked: document.getElementById('opt-sim').checked,
+      mode: document.getElementById('hud-mode').textContent.trim(),
+      hud: document.getElementById('hud-motion').textContent.trim() };})()`);
+  check('回放数据加载成功（帧数/时长合理）',
+    mo.loaded && mo.s0.nframes > 1000 && mo.s0.nq === mo.before.nq,
+    `${mo.s0.nframes} 帧 × ${mo.s0.nq} @ ${mo.s0.fps} fps = ${mo.s0.duration} s`);
+  check('回放驱动 MuJoCo qpos 变化（机器人真的在动）', mo.moved, `最大变化 ${mo.movedBy}`);
+  check('回放时 HUD 显示运动仿真', mo.mode.includes('运动仿真'), `${mo.mode} · ${mo.hud}`);
+  check('回放时自动隐藏楼梯（录制在平地上进行）',
+    mo.stairsAfter === false, `showStairs: ${mo.before.stairs} → ${mo.stairsAfter}`);
+  check('回放与本地物理互斥（自动关掉 mj_step）', mo.simChecked === false);
+  console.log(`  （回放前向计算用: ${mo.kinematics}｜跟踪统计: ${JSON.stringify(mo.s0.stats)}）`);
+
+  const mo2 = await evalJs(ws, `(async()=>{const $=id=>document.getElementById(id);
+    const t0 = __elf.getMotion().time;
+    $('btn-motion-pause').click();
+    const p0 = Array.from(__elf.data.qpos);
+    await new Promise(x=>setTimeout(x,600));
+    const p1 = Array.from(__elf.data.qpos);
+    const paused = p0.every((v,i)=>Math.abs(v-p1[i])<1e-9);
+    $('btn-motion-restart').click();
+    const tAfterRestart = __elf.getMotion().time;
+    $('btn-motion-pause').click();
+    const q0 = Array.from(__elf.data.qpos);
+    await new Promise(x=>setTimeout(x,600));
+    const moved2 = q0.some((v,i)=>Math.abs(v-__elf.data.qpos[i])>1e-4);
+    __elf.setMotion('off');
+    await new Promise(x=>setTimeout(x,300));
+    return { t0, paused, tAfterRestart, moved2,
+      off: { name: __elf.getMotion().name, mode: $('hud-mode').textContent.trim(),
+             hud: $('hud-motion').textContent.trim(),
+             minZ: +__elf.mjScene.robotMinZ().toFixed(4),
+             z: +__elf.data.qpos[2].toFixed(3) } };})()`);
+  check('暂停按钮生效（回放停住）', mo2.paused && mo2.t0 > 0, `暂停时 t=${mo2.t0}s`);
+  check('从头播放按钮生效', mo2.tAfterRestart < 0.1, `t → ${mo2.tAfterRestart}`);
+  check('恢复播放后继续推进', mo2.moved2);
+  check('切回“关闭”回到静止站立（脚底仍对齐 z=0）',
+    mo2.off.name === 'off' && mo2.off.mode.includes('静止站立') && Math.abs(mo2.off.minZ) < 0.01,
+    JSON.stringify(mo2.off));
+
   // 6. 渲染循环确实在出帧
   const frames = await evalJs(ws, `(async()=>{const r=__elf.renderer;const a=r.info.render.frame;
     await new Promise(x=>setTimeout(x,800));return r.info.render.frame-a;})()`);
@@ -187,6 +244,27 @@ try {
   check('WebXR 已在渲染器上启用', xr.xrEnabled === true);
   check('VR 漫游模块已就绪', xr.vrNavReady === true, `参考空间: ${xr.refSpace}`);
   console.log(`  （无头浏览器 immersive-vr 支持: ${JSON.stringify(xr.immersiveVR)} — 头显里这才是 true）`);
+
+  // 8. URL 参数路径（一键脚本 start_vr_motion.bat / .sh 走的就是这条）
+  const q = `${url}${url.includes('?') ? '&' : '?'}motion=fight_policy&speed=0.5&follow=0`;
+  await rpc(ws, 'Page.navigate', { url: q });
+  let auto = null;
+  for (let i = 0; i < 200; i++) {
+    await sleep(500);
+    auto = await evalJs(ws, `(()=>{try{return{ok:!!window.__elf,m:window.__elf.getMotion(),
+      mode:document.getElementById('hud-mode').textContent.trim(),
+      speed:document.getElementById('opt-motion-speed').value,
+      follow:document.getElementById('opt-follow').checked,
+      vrFollow:__elf.vrNav?__elf.vrNav.follow:null}}catch(e){return{err:String(e)}}})()`);
+    if (auto && auto.ok && auto.m && auto.m.kind) break;
+  }
+  check('URL 参数 ?motion=… 自动进入运动仿真回放',
+    !!(auto && auto.m && auto.m.kind === 'policy'), JSON.stringify(auto && auto.m));
+  check('URL 参数 ?speed / ?follow 生效',
+    !!auto && auto.speed === '0.5' && auto.follow === false && auto.vrFollow === false,
+    `speed=${auto && auto.speed} follow=${auto && auto.follow}`);
+  check('带参数进入时 HUD 直接显示运动仿真',
+    !!auto && auto.mode.includes('运动仿真'), auto && auto.mode);
 
   check('控制台无报错', errors.length === 0, errors.slice(0, 4).join(' | ') || '干净');
 

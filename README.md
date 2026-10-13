@@ -112,5 +112,6 @@ python elf3_play.py --policy onnx --viewer native
 | `scene_bx.xml` | 场景：地面 + 15 级台阶 |
 | `meshes/*.STL` | 机器人网格（34 个） |
 | `view_mujoco.py` | MuJoCo **原生 OpenGL 查看器**，核对模型原始装配（需 `pip install mujoco numpy`） |
-| `render_views.py` | 用 MuJoCo Python 渲染器输出多视角参考图 |
-| `demo_vuer_vr.py` | 早期 vuer / WebXR 版本（已被 `web/` 取代，保留备查） |
+
+> 早期的实验脚本与产物（vuer/WebXR 原型、多视角渲染、模型编译 dump `compiled_ascii.txt` /
+> `elf3_compiled.mjb` 等）已清理，需要时用 `git checkout 40b8606 -- <路径>` 从历史取回。

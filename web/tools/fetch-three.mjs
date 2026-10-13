@@ -13,7 +13,6 @@ const BASE = `https://cdn.jsdelivr.net/npm/three@${VERSION}`;
 const jobs = [
   [`${BASE}/build/three.module.js`, path.join(V, 'three.module.js')],
   [`${BASE}/examples/jsm/controls/OrbitControls.js`, path.join(J, 'controls/OrbitControls.js')],
-  [`${BASE}/examples/jsm/webxr/VRButton.js`, path.join(J, 'webxr/VRButton.js')],
   [`${BASE}/examples/jsm/utils/BufferGeometryUtils.js`, path.join(J, 'utils/BufferGeometryUtils.js')],
 ];
 

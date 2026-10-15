@@ -415,10 +415,17 @@ async function setMotion(name, { hideStairs = true } = {}) {
   motion.restart();
   $('btn-motion-pause').textContent = '暂停';
 
-  // 录制的策略仿真是在平地上跑的；网页场景里的楼梯只是静态摆设，隐藏掉避免视觉穿模
-  if (hideStairs) {
-    const st = $('opt-stairs');
-    if (st.checked) { st.checked = false; st.dispatchEvent(new Event('change')); }
+  // 录制的打拳回放是在平地上跑的；网页场景里的地形只是静态摆设，隐藏掉避免视觉穿模。
+  // 「策略仿真 · 爬楼梯」那段回放本身就踩在这块地形上：不但不能隐藏，还要确保它是显示的。
+  const stairsEl = $('opt-stairs');
+  if (motion.kind === 'climb') {
+    if (!stairsEl.checked) {
+      stairsEl.checked = true;
+      stairsEl.dispatchEvent(new Event('change'));
+    }
+  } else if (hideStairs && stairsEl.checked) {
+    stairsEl.checked = false;
+    stairsEl.dispatchEvent(new Event('change'));
   }
 
   renderer.shadowMap.autoUpdate = true;
@@ -427,11 +434,17 @@ async function setMotion(name, { hideStairs = true } = {}) {
   $('hud-motion').textContent = motion.describe();
 
   const s = motion.meta.stats;
-  $('motion-note').innerHTML = (motion.kind === 'ref'
+  const note = motion.kind === 'ref'
     ? '参考动作：<code>fight.npz</code> 里重定向后的运动，纯运动学装配（无物理）。'
-    : '策略仿真：本机跑 MuJoCo + <code>policy.onnx</code> 闭环录制。'
-      + (s ? `跟踪误差：均值 ${s.anchorErrMean} m / 最大 ${s.anchorErrMax} m，`
-        + `躯干最大倾角 ${s.tiltMax}°。` : ''))
+    : motion.kind === 'climb'
+      ? '策略仿真：本机跑 MuJoCo + <code>normal_depth.onnx</code> 深度视觉闭环录制'
+        + '（躯干俯视深度相机；地形 = <code>universal_test</code> 紧凑障碍）。'
+        + (s ? `<br>最远 x = ${s.maxX} m（终点线 13.2 m），躯干高度 `
+          + `${s.rootZMin} ~ ${s.rootZMax} m，${s.fell ? '末段摔倒' : '全程未摔倒'}。` : '')
+      : '策略仿真：本机跑 MuJoCo + <code>policy.onnx</code> 闭环录制。'
+        + (s ? `跟踪误差：均值 ${s.anchorErrMean} m / 最大 ${s.anchorErrMax} m，`
+          + `躯干最大倾角 ${s.tiltMax}°。` : '');
+  $('motion-note').innerHTML = note
     + `<br>${motion.nframes} 帧 @ ${motion.fps} fps = ${motion.duration.toFixed(1)} s。`;
   toast(`已载入回放：${motion.label}`);
   log(`· 回放数据 ${name}：${motion.nframes} 帧 / ${motion.duration.toFixed(1)} s`);

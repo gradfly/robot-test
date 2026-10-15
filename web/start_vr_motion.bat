@@ -1,51 +1,62 @@
 @echo off
 chcp 65001 >nul
-rem ============================================================
-rem  elf3 运动仿真 · 一键在网页端 / VR 头显里观看
-rem
-rem  和 start.bat 的区别：本脚本直接进入「运动仿真回放」模式
-rem  （策略跟踪 fight.npz 的打拳动作），并自动准备好回放数据。
-rem  start.bat / start.sh 保持原样，只做「静止站立」查看。
-rem
-rem  用法：双击本文件即可。命令行可选参数：
-rem    --rebake        重新跑一遍本机 MuJoCo 仿真，刷新回放数据
-rem    --http-port N   指定 HTTP 端口（默认 8080）
-rem    --https-port N  指定 HTTPS 端口（默认 8443，VR 头显走这个）
-rem    其它参数原样转给 server.mjs
-rem ============================================================
 setlocal enabledelayedexpansion
+title elf3 - MuJoCo web viewer (motion replay)
+
+REM ============================================================
+REM  elf3 MuJoCo web viewer - one-click MOTION REPLAY mode
+REM
+REM  Difference from start.bat: this one opens the page already in
+REM  "motion replay" mode (?motion=fight_policy) and makes sure the
+REM  replay data exists before starting the server.
+REM
+REM  Usage: double-click it, or from a command line:
+REM     start_vr_motion.bat --rebake         force re-record the replay data
+REM     start_vr_motion.bat --http-port 9000 extra flags go to server.mjs
+REM
+REM  !! KEEP THIS FILE ASCII-ONLY WITH CRLF LINE ENDINGS !!
+REM  See the note in start.bat - UTF-8 Chinese text or bare LF
+REM  endings break cmd.exe parsing of this file.
+REM ============================================================
+
 cd /d "%~dp0"
 
+REM ---------- split our own flags from the ones for server.mjs ----------
 set "REBAKE="
 set "ARGS="
 :parse
 if "%~1"=="" goto parsed
-if /i "%~1"=="--rebake" (set "REBAKE=1") else (set "ARGS=!ARGS! %~1")
+if /i "%~1"=="--rebake" (
+    set "REBAKE=1"
+) else (
+    set "ARGS=!ARGS! %~1"
+)
 shift
 goto parse
 :parsed
 
+REM ---------- locate node.exe ----------
 set "NODE="
-where node >nul 2>nul
-if %errorlevel%==0 set "NODE=node"
+set "CAND=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
+if exist "!CAND!" set "NODE=!CAND!"
 if not defined NODE (
-  set "CAND=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
-  if exist "!CAND!" set "NODE=!CAND!"
+    where node >nul 2>nul
+    if !errorlevel! equ 0 set "NODE=node"
 )
 if not defined NODE (
-  echo.
-  echo  [错误] 未找到 Node.js 18+，请先安装：https://nodejs.org/
-  echo.
-  pause
-  exit /b 1
+    echo.
+    echo [ERROR] Node.js not found. Install Node.js 18+ : https://nodejs.org/
+    echo.
+    goto :fail
 )
 
+REM ---------- locate python.exe (only needed to record the replay data) ----------
 set "PY="
 set "VENV=%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
 if exist "!VENV!" set "PY=!VENV!"
 if not defined PY (
-  where python >nul 2>nul
-  if !errorlevel!==0 set "PY=python"
+    where python >nul 2>nul
+    if !errorlevel! equ 0 set "PY=python"
 )
 
 set "MOTION=assets\motion_fight_policy.bin"
@@ -55,36 +66,44 @@ goto run
 
 :bake
 if not defined PY (
-  echo  [提示] 没找到 Python，跳过重新录制（沿用已有回放数据）。
-  goto run
+    echo [NOTE] Python not found - keeping the existing replay data.
+    goto run
 )
 echo.
-echo  [1/3] 重新录制运动仿真数据（MuJoCo + policy.onnx 闭环，约 20~40 秒）…
+echo [1/3] Re-recording motion replay data (MuJoCo + policy.onnx, 20-40 s) ...
 echo.
 "!PY!" "tools\bake_motion.py"
-if errorlevel 1 echo  [警告] 录制失败，继续沿用已有回放数据。
+if errorlevel 1 echo [WARN] Recording failed - keeping the existing replay data.
 goto run
 
 :bake_none
 echo.
-echo  [1/3] 首次运行：本地录制运动仿真数据（MuJoCo + policy.onnx 闭环）…
+echo [1/3] First run - recording motion replay data locally (MuJoCo + policy.onnx) ...
 echo.
 if defined PY (
-  "!PY!" "tools\bake_motion.py"
-  if errorlevel 1 echo  [警告] 录制失败：页面会打开，但「运动仿真」可能加载失败。
+    "!PY!" "tools\bake_motion.py"
+    if errorlevel 1 echo [WARN] Recording failed - the page still opens but "motion replay" may fail to load.
 ) else (
-  echo  [警告] 缺少回放数据 assets\motion_fight_policy.bin，且未找到 Python。
-  echo         页面仍会打开，但「运动仿真」会提示加载失败。
-  echo         补数据：python web\tools\bake_motion.py
+    echo [WARN] Replay data assets\motion_fight_policy.bin is missing AND Python was not found.
+    echo        The page still opens, but "motion replay" reports a load error.
+    echo        To fix it: python web\tools\bake_motion.py
 )
 
 :run
 echo.
-echo  [2/3] 启动本地服务器（HTTP + HTTPS 双端口）…
-echo  [3/3] 浏览器会自动打开「运动仿真」页面。
-echo        VR 头显：连同一个 Wi-Fi，在头显浏览器里打开下面打印的
-echo        https 局域网地址（带 ?motion=fight_policy 的那一条）。
+echo [2/3] Starting the local server (HTTP + HTTPS) ...
+echo [3/3] The browser opens directly in MOTION REPLAY mode.
+echo       VR headset: same Wi-Fi, open the https:// LAN address printed below.
 echo.
 "!NODE!" server.mjs --open --open-path "/?motion=fight_policy"!ARGS!
 echo.
-pause
+echo Press any key to close this window...
+pause >nul
+exit /b 0
+
+:fail
+echo.
+echo ------------------- FAILED -------------------
+echo Press any key to close this window...
+pause >nul
+exit /b 1

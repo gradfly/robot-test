@@ -1,10 +1,12 @@
 # elf3 · MuJoCo 网页端仿真 + VR 沉浸式观看
 
 在浏览器里跑**真正的 MuJoCo 物理引擎**（官方 WebAssembly 构建），把 `elf3.xml` +  
-`scene_bx.xml`（楼梯 / 地面）渲染成三维场景，并支持用 **VR 头显沉浸式观看**。  
+`scene_bx.xml`（地形）渲染成三维场景，并支持用 **VR 头显沉浸式观看**。  
 默认状态是**静止站立**：机器人保持 XML 里的初始位形，不跑物理。  
-也可以在网页 / VR 里回放**策略跑出来的运动仿真**（`elf3_play.py` 那条
-MuJoCo + `policy.onnx` 闭环、跟踪 `fight.npz` 打拳动作的画面）—— 见 §3。
+也可以在网页 / VR 里回放**策略跑出来的运动仿真**：`elf3_play.py` 那条
+MuJoCo + `policy.onnx` 闭环、跟踪 `fight.npz` 打拳动作的画面，以及
+`climb_stairs.py` 那条**深度视觉闭环爬楼梯**的画面（地形为 `universal_test`
+紧凑障碍）—— 见 §3。
 
 ---
 
@@ -142,16 +144,16 @@ python view_mujoco.py --drop   # 落地对齐：消除脚底悬空
 
 ---
 
-## 3. 运动仿真回放（策略跟踪「打拳」动作）
+## 3. 运动仿真回放（打拳 / 爬楼梯）
 
 页面默认只摆位、不跑物理。右侧面板第一栏「运动仿真」可以把**策略跑出来的运动仿真**
-放到网页 / VR 里看 —— 也就是 `elf3_play.py` 那条链路（MuJoCo + `policy.onnx`
-跟踪 `fight.npz`）的画面。
+放到网页 / VR 里看 —— 有两条链路，回放数据都是本机先跑一遍录下来的：
 
 | 回放数据 | 内容 | 时长 |
 | --- | --- | --- |
-| 策略仿真 · 打拳 | 本机跑 **MuJoCo + policy.onnx** 闭环仿真录制的 qpos（含物理接触、关节跟踪） | 146.8 s |
+| 策略仿真 · 打拳 | `elf3_play.py` 链路：本机跑 **MuJoCo + policy.onnx** 闭环仿真录制的 qpos（含物理接触、关节跟踪） | 146.8 s |
 | 参考动作 · 打拳 | 直接取 `fight.npz` 里重定向后的运动（纯运动学，无物理） | 244.9 s |
+| 策略仿真 · 爬楼梯 | `climb_stairs.py` 链路：本机跑**深度视觉闭环**（MuJoCo 渲染深度图 → `normal_depth.onnx` → PD 力矩 → `mj_step`），在 `universal_test` 紧凑地形上从低楼梯爬过终点线 | 26.4 s |
 
 浏览器里的 MuJoCo WASM 没有策略网络（没有 onnxruntime），所以网页端**不现算策略**：
 先在本地把仿真跑一遍，把每个控制步（50 Hz）的 `qpos` 录成 float32 二进制
@@ -162,33 +164,46 @@ VR 里动作平滑不抖。
 重新录制（换了模型 / 策略 / 动作数据之后）：
 
 ```bash
+# —— 打拳两段（elf3_play.py 链路）——
 python web/tools/bake_motion.py                       # 整段录，约 20~40 s
 python web/tools/bake_motion.py --steps 1500          # 只录前 30 s
 python web/tools/bake_motion.py --only ref            # 只录参考动作
 python web/tools/bake_motion.py --stop-on tracking    # 改用 mjlab 严格跟踪判据截断
+
+# —— 爬楼梯（climb_stairs.py 深度视觉链路，需本机有 E:/mujoco/climb stairs 工作区）——
+python web/tools/bake_climb.py                        # 默认 34 s，楼梯前 1.2 m 出生
+python web/tools/bake_climb.py --duration 20          # 只录前 20 s
+python web/tools/bake_climb.py --cmd-vx 0.4           # 走慢一点
+python web/tools/bake_climb.py --spawn-x 0            # 从世界原点出发（先走 4.6 m 平地）
 ```
 
 面板上的控件：
 
 | 控件 | 说明 |
 | --- | --- |
-| 回放 | 关闭（静止站立）/ 策略仿真 · 打拳 / 参考动作 · 打拳 |
+| 回放 | 关闭（静止站立）/ 策略仿真 · 打拳 / 参考动作 · 打拳 / **策略仿真 · 爬楼梯** |
 | 倍速 | 0.25× / 0.5× / 1× / 1.5× |
 | 视角跟随机器人 | 机器人会满场走动（世界坐标约 ±5 m），打开后镜头自动跟住它 |
 | 从头播放 / 暂停 | 控制回放进度（「复位姿态」在回放中也等价于从头播放） |
 
 几点说明：
 
-- 回放数据是**在平地上**录的，而网页场景里带 15 级台阶，所以开启回放时会自动把
-  「楼梯 / 障碍」关掉避免视觉穿模；想看台阶可以自己再勾回来。
+- **打拳两段**回放是**在平地上**录的，所以选它们时会自动把「楼梯 / 障碍」关掉避免
+  视觉穿模；想看地形可以自己再勾回来。
+- **爬楼梯那段**回放本身就**踩在这块地形上**：选它时不会隐藏「楼梯 / 障碍」，而且
+  如果之前被关掉了还会自动打开（录制起点在低楼梯前约 1.2 m，一路爬过终点线）。
+- 爬楼梯回放的机器人**从 x≈3.5 m 出发**，不在世界原点；开着「视角跟随机器人」
+  镜头会自动跟过去（默认开着）。想看全景可以点「全景」预设。
 - 开启回放会**自动关掉「运行 MuJoCo 物理」**：两者互斥（一个是回放录好的 qpos，
   一个是本地现算 `mj_step`）。
-- 策略在 t≈148 s 会失稳摔倒，所以录制在**最后一次姿态健康**的时刻截断
-  （倾角 < 30°、根高 > 0.80 m），回放里不会看到倒地画面。
+- 打拳策略在 t≈148 s 会失稳摔倒，所以录制在**最后一次姿态健康**的时刻截断
+  （倾角 < 30°、根高 > 0.80 m），回放里不会看到倒地画面；爬楼梯那段则是一路
+  跑到越过终点线（x > 13.4 m）自动收尾，全程未摔倒。
 - VR 里的「视角跟随」是**舒适窗口式**的：机器人在 1.7 ~ 4.8 m 内且大致在身前就
   完全不动，跑出这个范围才慢慢把它拉回正前方 —— 不会和你自己的摇杆移动打架。
   A / X「把机器人摆到正前方」也按它的**实际位置**摆位（回放时它不在世界原点）。
-- URL 参数：`?motion=fight_policy&speed=0.5&follow=0`（一键脚本用的就是这条）。
+- URL 参数：`?motion=fight_policy&speed=0.5&follow=0`
+  （一键脚本用的就是这条；爬楼梯用 `?motion=climb_policy`）。
 
 ---
 
@@ -245,7 +260,7 @@ python web/tools/bake_motion.py --stop-on tracking    # 改用 mjlab 严格跟�
 | 控件           | 说明                                          |
 | ------------ | ------------------------------------------- |
 | 机器人          | 显示 / 隐藏 30 个视觉网格（group 2）                   |
-| 楼梯 / 障碍      | 显示 / 隐藏 `scene_bx.xml` 里的 15 级台阶            |
+| 楼梯 / 障碍      | 显示 / 隐藏 `scene_bx.xml` 里的地形（`universal_test` 紧凑障碍：10 cm 低楼梯 / 15 cm 高楼梯 / 壕沟堤岸） |
 | 地面网格         | 显示 / 隐藏地板                                   |
 | 阴影           | 开关实时阴影                                      |
 | 碰撞体（调试图层）    | 显示 group 3 的 36 个碰撞几何（绿色半透明 capsule）        |
@@ -274,10 +289,11 @@ web/
 ├── jsm/                  three.js addons（OrbitControls / RoomEnvironment）
 ├── assets/
 │   ├── elf3.xml          机器人模型（第 463 行 <include file="scene_bx.xml"/>）
-│   ├── scene_bx.xml      场景：地面 + 15 级台阶
+│   ├── scene_bx.xml      地形：universal_test 紧凑障碍（地面 + 低楼梯 / 高楼梯 / 壕沟堤岸）
 │   ├── meshes/*.STL      34 个网格
 │   ├── motion_fight_policy.bin/.json   策略仿真回放数据（bake_motion.py 生成）
 │   ├── motion_fight_ref.bin/.json      参考动作回放数据
+│   ├── motion_climb_policy.bin/.json   爬楼梯回放数据（bake_climb.py 生成）
 │   └── manifest.json     资源清单（加载进度用；不含回放数据）
 ├── certs/                自签证书（首次启动自动生成）
 ├── server.mjs            本地服务器：HTTP + HTTPS 双监听
@@ -350,15 +366,43 @@ onSeeThrough` 三个回调里接 UI。`setSeeThrough()` 幂等且不依赖真头
 
 ---
 
+### 7.6 爬楼梯回放（`motion_climb_policy`）的三个关键点
+
+1. **关节顺序对账** —— 物理仿真跑的是官方 `data/mujoco_simulation/elf3.xml`
+   （nq=38：自由基座 7 + 29 个策略关节 + `head_z_joint` / `head_y_joint` 两个头部
+   关节）；网页端用的是老版 `assets/elf3.xml`（nq=36，没有那两个头部关节）。
+   两者前 36 个 qpos 的**关节顺序与 `jnt_qposadr` 完全一致**，所以
+   `bake_climb.py` 是按关节名逐一对齐后写出的（当前就是原样截取 `qpos[:36]`）——
+   哪一侧以后调了关节顺序也能自动重排，不会录出"关节乱掉"的回放。
+2. **地形拍平** —— `assets/scene_bx.xml` 现在是 `terrains/universal_test/` 下
+   `assets.xml`（材质）+ `base.xml`（光照 / 地面 / 出生点）+ `compact_obstacles.xml`
+   （低楼梯 / 高楼梯 / 壕沟）三个文件的拍平版，几何尺寸、位置、摩擦逐条照抄。
+   之所以拍平而不是改 `elf3.xml` 的 include：网页端是 `from_xml_string(xml, vfs)`
+   编译的，VFS 里没有"文件所在目录"的概念，嵌套 include 的相对路径不可靠。
+3. **世界坐标必须一致** —— 回放写的是**绝对 qpos**，所以网页里的地形要与录制时
+   逐条相同（`pos` / `size` 完全同值），`bake_climb.py` 也是直接拿官方那份
+   "机器人 + 地形"完整场景跑的。
+
+两个小细节：
+
+- 地面 geom 仍叫 `floor`（官方叫 `ut_infinite_ground`）：`elf3.xml` 的 `<contact>`
+  里有 14 条足底-地面 pair 写死了 `geom2="floor"`，改名会让模型编译失败。
+- 地形里的起点 / 终点 / 壕沟断口标记在官方 XML 里是 `<site>`，而
+  `js/mjscene.js` 只渲染 geom —— 所以它们在网页里不显示（MuJoCo 原生查看器 /
+  Python 渲染里照常可见）。
+
+---
+
 ## 8. 工具（`tools/`）
 
 | 脚本                  | 用途                                                   |
 | ------------------- | ---------------------------------------------------- |
-| `verify.mjs`        | **端到端自检**：加载 / 模型 / UI / 开关 / 视角 / 物理 / 复位 / XR / 半透明透视，45 项 |
+| `verify.mjs`        | **端到端自检**：加载 / 模型 / UI / 开关 / 视角 / 物理 / 复位 / 回放（打拳 + 爬楼梯）/ XR / 半透明透视，51 项 |
 | `shoot.mjs`         | 用 CDP 等页面就绪后截图（可注入 JS 改相机、改可见性）                      |
 | `dump-geoms.mjs`    | 列出每个视觉网格的世界 AABB，用于和 MuJoCo 对账                       |
 | `make-manifest.mjs` | 重新生成 `assets/manifest.json`                          |
 | `bake_motion.py`    | 本机跑 MuJoCo + `policy.onnx`，把每步 qpos 录成 `assets/motion_*.bin` |
+| `bake_climb.py`     | 本机跑 MuJoCo + `normal_depth.onnx` 深度视觉闭环（复用 climb stairs 工作区的 `climb_stairs.py`），把爬楼梯的每步 qpos 录成 `assets/motion_climb_policy.bin` |
 | `fetch-three.mjs`   | 下载 three.js 与 addons                                 |
 | `selfsign.mjs`      | 纯 JS 生成自签证书（无 openssl 依赖，SAN 含本机所有内网 IP）             |
 | `make-cert.mjs`     | 证书生成的封装                                              |
@@ -374,6 +418,18 @@ node tools/verify.mjs https://192.168.22.19:8443/   # 头显走的这条路
 ---
 
 ## 9. 常见问题
+
+**Q：双击 `start.bat` 没反应 / 窗口一闪而过 / `http://localhost:8080` 打不开？**  
+A：`start.bat` 和 `start_vr_motion.bat` 是 **cmd 批处理**，而 `cmd.exe` 是**按字节**逐行
+解析它们的，用的是系统 OEM 代码页（中文 Windows = CP936/GBK）。所以这两个文件必须是
+**纯 ASCII + CRLF 行尾**：一旦写进 UTF-8 中文（一个汉字 3 字节，按 GBK 两字节分组会
+**吞掉后面的换行**）或改成裸 LF，解析立刻错位，**其后所有命令都被当成乱码命令丢弃** ——
+表现就是双击秒关、端口根本没起来。  
+`chcp 65001` **救不了这个问题**：它只改控制台输出的代码页，不改变 bat 文件自身被解析的
+方式。  
+（2026-10-13 已修复这两个文件。）如果你要改它们，请保持纯英文注释和提示，并用 Python
+写文件：`open(p, "wb").write(text.replace("\n", "\r\n").encode("ascii"))` ——
+别用记事本「另存为 UTF-8」。
 
 **Q：点「半透明 VR」没反应 / 按钮是灰的？**  
 A：透视走的是 WebXR `immersive-ar`，需要**带彩色摄像头的头显**（Quest 2/3/Pro
@@ -399,6 +455,16 @@ A：首次要下载约 10 MB 的 MuJoCo WASM + 约 12 MB 的 STL 网格，之后
 **Q：面板里选「策略仿真 · 打拳」提示"加载失败"？**  
 A：缺 `assets/motion_fight_policy.bin`。跑一次 `python web/tools/bake_motion.py`
 生成即可（或直接用 `start_vr_motion.bat` / `.sh`，它会自动补上）。
+
+**Q：面板里选「策略仿真 · 爬楼梯」提示"加载失败"？**  
+A：缺 `assets/motion_climb_policy.bin`。跑一次 `python web/tools/bake_climb.py`
+生成即可。注意它是**深度视觉闭环**，需要本机有 `E:/mujoco/climb stairs` 工作区
+（提供 `climb_stairs.py`、`normal_depth.onnx` 和 `universal_test` 地形）；换目录用
+`--ws <路径>` 指定。
+
+**Q：选了「策略仿真 · 爬楼梯」，但机器人脚下没有地形？**  
+A：正常情况下选这一项会自动把「楼梯 / 障碍」勾上。如果你手动取消勾选，地形就会
+藏起来而机器人仍在爬（看起来像在踏空）—— 再勾回来即可。
 
 **Q：页面显示"启动失败"？**  
 A：加载层会直接打印错误信息。常见原因是资源没就位——确认是在 `web/` 目录下、  

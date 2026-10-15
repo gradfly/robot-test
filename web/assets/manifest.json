@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-11T15:13:13.312Z",
+  "generatedAt": "2026-10-13T06:26:05.996Z",
   "entry": "elf3.xml",
   "files": [
     {
@@ -8,7 +8,7 @@
     },
     {
       "path": "scene_bx.xml",
-      "size": 8111
+      "size": 8386
     },
     {
       "path": "meshes/l_ankle_x_link.STL",
@@ -147,5 +147,5 @@
       "size": 500034
     }
   ],
-  "totalBytes": 12071303
+  "totalBytes": 12071578
 }

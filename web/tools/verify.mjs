@@ -232,6 +232,56 @@ try {
     mo2.off.name === 'off' && mo2.off.mode.includes('静止站立') && Math.abs(mo2.off.minZ) < 0.01,
     JSON.stringify(mo2.off));
 
+  // 5.6 「楼梯 / 障碍」里的地形 + 爬楼梯回放
+  const terrain = await evalJs(ws, `(()=>{const mc=__elf.mujoco,m=__elf.model;
+    const names=[...__elf.mjScene.envGeomIds].map(g=>mc.mj_id2name(m,mc.mjtObj.mjOBJ_GEOM.value,g)||'');
+    return {count:names.length, samples:names.slice(0,3),
+      low:names.filter(n=>n.includes('low_stair')).length,
+      high:names.filter(n=>n.includes('high_stair')).length,
+      trench:names.filter(n=>n.includes('trench')).length,
+      oldStairs:names.filter(n=>/^step/.test(n)).length};})()`);
+  check('“楼梯 / 障碍”里是 universal_test 紧凑地形（低楼梯 / 高楼梯 / 壕沟齐全）',
+    terrain.low === 5 && terrain.high === 3 && terrain.trench === 3 && terrain.oldStairs === 0,
+    `${terrain.count} 个地形几何：低楼梯 ${terrain.low} / 高楼梯 ${terrain.high} / 壕沟 ${terrain.trench}`);
+
+  const climb = await evalJs(ws, `(async()=>{const $=id=>document.getElementById(id);
+    __elf.setMotion('off');
+    const r = await __elf.setMotion('climb_policy');
+    const s0 = __elf.getMotion();
+    const q0 = Array.from(__elf.data.qpos);
+    await new Promise(x=>setTimeout(x,1600));
+    const q1 = Array.from(__elf.data.qpos);
+    return { loaded: !!r, kind: s0.kind, nframes: s0.nframes, nq: s0.nq, stats: s0.stats,
+      stairsOn: __elf.mjScene.opts.showStairs, stairsChecked: $('opt-stairs').checked,
+      moved: q0.some((v,i)=>Math.abs(v-q1[i])>1e-4),
+      x0: +q0[0].toFixed(2), x1: +q1[0].toFixed(2),
+      mode: $('hud-mode').textContent.trim(),
+      hud: $('hud-motion').textContent.trim(),
+      note: $('motion-note').textContent.trim() };})()`);
+  check('爬楼梯回放加载成功（kind=climb，帧数/时长合理）',
+    climb.loaded && climb.kind === 'climb' && climb.nframes > 500,
+    `${climb.nframes} 帧 × ${climb.nq}｜${climb.hud}`);
+  check('爬楼梯回放保留地形（不自动隐藏“楼梯 / 障碍”）',
+    climb.stairsOn === true && climb.stairsChecked === true,
+    `showStairs=${climb.stairsOn} / 复选框=${climb.stairsChecked}`);
+  check('爬楼梯回放真的在前进（x 增大）',
+    climb.moved && climb.x1 > climb.x0 + 0.02, `x ${climb.x0} → ${climb.x1}`);
+  check('爬楼梯回放 HUD 正常显示', climb.mode.includes('运动仿真'), `${climb.mode} · ${climb.hud}`);
+  console.log(`  （爬楼梯回放统计: ${JSON.stringify(climb.stats && {
+    maxX: climb.stats.maxX, fell: climb.stats.fell, rootZMax: climb.stats.rootZMax })}）`);
+  console.log(`  （说明文案: ${climb.note.replace(/\s+/g, ' ').slice(0, 110)}…）`);
+
+  const climb2 = await evalJs(ws, `(async()=>{const $=id=>document.getElementById(id);
+    __elf.setMotion('off');
+    const el=$('opt-stairs'); el.checked=false; el.dispatchEvent(new Event('change'));
+    const beforeHide = __elf.mjScene.opts.showStairs;
+    await __elf.setMotion('climb_policy');
+    const afterPick = __elf.mjScene.opts.showStairs;
+    await __elf.setMotion('off');
+    return { beforeHide, afterPick, checked:$('opt-stairs').checked };})()`);
+  check('选“策略仿真 · 爬楼梯”会自动打开“楼梯 / 障碍”',
+    climb2.beforeHide === false && climb2.afterPick === true, JSON.stringify(climb2));
+
   // 6. 渲染循环确实在出帧
   const frames = await evalJs(ws, `(async()=>{const r=__elf.renderer;const a=r.info.render.frame;
     await new Promise(x=>setTimeout(x,800));return r.info.render.frame-a;})()`);
